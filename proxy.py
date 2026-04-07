@@ -70,7 +70,16 @@ BROWSER_HEADERS = {
     'content-type': 'application/json',
     'origin': 'https://claude.ai',
     'referer': 'https://claude.ai/',
+    'sec-ch-ua': '"Chromium";v="146", "Google Chrome";v="146", "Not?A_Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
 }
+
+CHROME_IMPERSONATE = 'chrome146'
 
 PORT = int(os.environ.get('PORT', '3456'))
 TARGET_URL = os.environ.get('TARGET_URL', 'https://api.anthropic.com')
@@ -239,7 +248,7 @@ def _sync_claude_ai_request(method, url_path, session_key, body=None):
         headers=BROWSER_HEADERS,
         cookies={'sessionKey': session_key},
         data=data,
-        impersonate='chrome',
+        impersonate=CHROME_IMPERSONATE,
         timeout=30,
     )
     return resp.status_code, resp.text
