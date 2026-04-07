@@ -193,19 +193,55 @@ function startLogin() {
 
   loginState.process = child;
   let loginSent = false;
+  let inputCount = 0; // track how many auto-inputs we've sent
+
+  function sendInput(text, label) {
+    if (loginState.process) {
+      console.log('[login] Sending: ' + label);
+      child.stdin.write(text);
+    }
+  }
 
   function handleOutput(data) {
     const text = data.toString();
     loginState.output += text;
-    const cleaned = text.replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '').trim();
-    if (cleaned) console.log('[login] ' + cleaned);
+    const cleaned = text.replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '').replace(/\x07/g, '').trim();
+    if (cleaned) console.log('[login] ' + cleaned.substring(0, 200));
 
-    // When REPL is ready or prompts for login, send /login command
+    // Auto-respond to onboarding prompts (theme selection, etc.)
+    // Detect numbered menu items like "1." "2." "3." with selection prompt
     if (!loginSent) {
-      if (/not logged in|\/login|>\s*$|welcome|claude/i.test(text)) {
+      // Theme or option selection: send "1" + Enter to pick first option
+      if (/\d+\.\s*(Dark|Light|Monokai|Solarized|Custom)/i.test(text) ||
+          /choose|select|pick/i.test(text)) {
+        if (inputCount < 5) { // safety limit
+          inputCount++;
+          setTimeout(function() { sendInput('1\n', 'option 1 (onboarding)'); }, 500);
+          return;
+        }
+      }
+      // Yes/No or confirmation prompt
+      if (/\(y\/n\)|yes\/no|accept|agree|continue/i.test(text)) {
+        if (inputCount < 5) {
+          inputCount++;
+          setTimeout(function() { sendInput('y\n', 'yes (onboarding)'); }, 500);
+          return;
+        }
+      }
+      // Enter to continue
+      if (/press enter|press return|hit enter/i.test(text)) {
+        if (inputCount < 5) {
+          inputCount++;
+          setTimeout(function() { sendInput('\n', 'Enter (onboarding)'); }, 500);
+          return;
+        }
+      }
+      // REPL is ready: detect prompt character or "not logged in"
+      if (/not logged in|\/login/i.test(text) ||
+          /^[>\$%]\s*$/m.test(cleaned) ||
+          /claude\s*>\s*$/i.test(cleaned)) {
         loginSent = true;
-        console.log('[login] Sending /login command to REPL');
-        child.stdin.write('/login\n');
+        setTimeout(function() { sendInput('/login\n', '/login'); }, 1000);
       }
     }
 
@@ -231,14 +267,14 @@ function startLogin() {
   child.stdout.on('data', handleOutput);
   child.stderr.on('data', handleOutput);
 
-  // Fallback: send /login after a delay if not auto-detected
+  // Fallback: send /login after a longer delay to allow onboarding to complete
   setTimeout(function() {
     if (!loginSent && loginState.process) {
       loginSent = true;
       console.log('[login] Fallback: sending /login command');
       child.stdin.write('/login\n');
     }
-  }, 5000);
+  }, 15000);
 
   child.on('close', function(code) {
     loginState.process = null;
