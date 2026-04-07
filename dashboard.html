@@ -32,18 +32,15 @@
   .model-item { padding: 7px 10px; background: #f8f8f8; border-radius: 6px; font-size: 13px; font-family: monospace; }
   .updated { font-size: 12px; color: #aaa; margin-top: 12px; }
   .oauth-box { margin-top: 14px; padding: 14px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e0e0e0; }
-  .oauth-box .step { margin-bottom: 12px; }
-  .oauth-box .step-num { display: inline-block; width: 24px; height: 24px; line-height: 24px; text-align: center; background: #4a90d9; color: #fff; border-radius: 50%; font-size: 12px; margin-right: 8px; }
-  .oauth-box .step-done { background: #2a7a2a; }
   .oauth-box input[type="text"] { width: 100%; padding: 8px 10px; border: 1px solid #d0d0d0; border-radius: 6px; font-size: 13px; font-family: monospace; margin: 6px 0; }
-  .oauth-box .hint { font-size: 12px; color: #999; margin-top: 4px; }
-  .oauth-box a { color: #4a90d9; text-decoration: none; word-break: break-all; }
-  .oauth-box a:hover { text-decoration: underline; }
+  .oauth-box .hint { font-size: 12px; color: #999; margin-top: 4px; line-height: 1.6; }
+  .oauth-box .hint code { background: #e8e8e8; padding: 1px 5px; border-radius: 3px; font-size: 11px; }
+  .oauth-box label { font-size: 14px; font-weight: 500; display: block; margin-bottom: 4px; }
   .alert-bar { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; display: none; }
   .alert-success { background: #e6f7e6; color: #2a7a2a; border: 1px solid #b5e8b5; display: block; }
   .alert-error { background: #fde8e8; color: #a33; border: 1px solid #f5c6c6; display: block; }
-  .link-btn { font-size: 12px; color: #4a90d9; cursor: pointer; background: none; border: none; text-decoration: underline; padding: 0; margin-top: 8px; }
-  .link-btn:hover { color: #2a5a9a; }
+  .loading-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 6px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   @media (max-width: 1024px) { .cards { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 768px) { .cards { grid-template-columns: 1fr; } .model-grid { grid-template-columns: 1fr; } }
 </style>
@@ -53,9 +50,9 @@
 <div id="alert-bar" class="alert-bar"></div>
 <div class="cards">
   <div class="card">
-    <h2>Auth Status<div class="btns"><button id="btn-login" onclick="startOAuth()" class="btn-primary">Login</button><button id="btn-auth" onclick="fetchAuth()">Refresh</button></div></h2>
+    <h2>Auth Status<div class="btns"><button id="btn-login" onclick="showLoginForm()" class="btn-primary">Login</button><button id="btn-auth" onclick="fetchAuth()">Refresh</button></div></h2>
     <div id="auth-content"><div class="empty">Loading...</div></div>
-    <div id="oauth-content"></div>
+    <div id="login-form"></div>
   </div>
   <div class="card">
     <h2>Speed Limits<button id="btn-limits" onclick="fetchLimits()">Refresh</button></h2>
@@ -88,23 +85,6 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 function pct(r,l) { if(!r||!l)return null; return Math.round((parseInt(r)/parseInt(l))*100); }
 function pctTag(v) { if(v===null)return''; var c=v>50?'tag-green':v>20?'tag-yellow':'tag-red'; return '<span class="tag '+c+'">'+v+'%</span>'; }
 
-// Check URL params for login result
-(function() {
-  var params = new URLSearchParams(window.location.search);
-  var login = params.get('login');
-  if (login === 'success') {
-    var bar = document.getElementById('alert-bar');
-    bar.className = 'alert-bar alert-success';
-    bar.textContent = 'Login successful! OAuth token has been saved.';
-    history.replaceState(null, '', '/');
-  } else if (login === 'error') {
-    var bar = document.getElementById('alert-bar');
-    bar.className = 'alert-bar alert-error';
-    bar.textContent = 'Login failed: ' + (params.get('msg') || 'Unknown error');
-    history.replaceState(null, '', '/');
-  }
-})();
-
 async function fetchAuth() {
   document.getElementById('btn-auth').disabled = true;
   try {
@@ -127,57 +107,51 @@ async function fetchAuth() {
   } finally { document.getElementById('btn-auth').disabled = false; }
 }
 
-// Primary login: redirect to server-side proxied OAuth flow
-function startOAuth() {
-  window.location.href = '/oauth-login';
-}
-
-// Fallback: manual paste flow
-async function startManualOAuth() {
-  try {
-    var res = await fetch('/auth-oauth-start', { method: 'POST' });
-    var d = await res.json();
-    if (!d.ok) { alert(d.error||'Failed'); return; }
-    showManualOAuthStep2(d.authUrl);
-  } catch(e) { alert(e.message); }
-}
-
-function showManualOAuthStep2(authUrl) {
-  var el = document.getElementById('oauth-content');
+function showLoginForm() {
+  var el = document.getElementById('login-form');
   el.innerHTML = '<div class="oauth-box">'
-    +'<div class="step"><span class="step-num step-done">1</span><strong>Authorization URL generated</strong></div>'
-    +'<div class="step"><span class="step-num">2</span><strong>Open this link to login:</strong><br>'
-    +'<a href="'+esc(authUrl)+'" target="_blank">'+esc(authUrl.substring(0,80))+'...</a></div>'
-    +'<div class="step"><span class="step-num">3</span><strong>After login, paste the callback URL or code:</strong><br>'
-    +'<input type="text" id="oauth-code-input" placeholder="Paste the full callback URL or just the code parameter">'
-    +'<div class="hint">After authorizing, copy the full URL from your browser and paste it here.</div>'
-    +'<button onclick="submitOAuthCode()" class="btn-primary" style="margin-top:8px;padding:6px 20px">Submit</button>'
-    +'</div></div>';
+    +'<label>SessionKey Login</label>'
+    +'<div class="hint">'
+    +'How to get sessionKey:<br>'
+    +'1. Open <a href="https://claude.ai" target="_blank">claude.ai</a> in any browser where you are logged in<br>'
+    +'2. Press F12 &rarr; Application &rarr; Cookies &rarr; <code>claude.ai</code><br>'
+    +'3. Find the <code>sessionKey</code> cookie and copy its value<br>'
+    +'</div>'
+    +'<input type="text" id="session-key-input" placeholder="Paste your sessionKey cookie value here">'
+    +'<button id="btn-submit-session" onclick="submitSessionKey()" class="btn-primary" style="margin-top:8px;padding:6px 20px">Login with SessionKey</button>'
+    +'</div>';
 }
 
-async function submitOAuthCode() {
-  var input = document.getElementById('oauth-code-input').value.trim();
-  if (!input) { alert('Please paste the callback URL or code'); return; }
-  var code = input;
-  if (input.startsWith('http')) {
-    try { var url = new URL(input); code = url.searchParams.get('code') || input; } catch(e) {}
-  }
+async function submitSessionKey() {
+  var input = document.getElementById('session-key-input').value.trim();
+  if (!input) { alert('Please paste the sessionKey'); return; }
+
+  var btn = document.getElementById('btn-submit-session');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loading-spinner"></span>Logging in...';
+
   try {
-    var res = await fetch('/auth-oauth-callback', {
+    var res = await fetch('/auth-session-login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ code: code }),
+      body: JSON.stringify({ sessionKey: input }),
     });
     var d = await res.json();
     if (d.ok) {
-      document.getElementById('oauth-content').innerHTML = '<div class="oauth-box">'
+      document.getElementById('login-form').innerHTML = '<div class="oauth-box">'
         +'<span class="tag tag-green">Login Successful!</span> Token: <code>'+esc(d.token)+'</code>'
-        +'<div class="hint">Expires: '+d.expiresAt+'</div></div>';
+        +'<div class="hint">Expires: '+(d.expiresAt||'N/A')+'</div></div>';
       fetchAuth();
     } else {
-      alert('Error: ' + (d.error||'Unknown error') + (d.detail ? '\n\nDetail: '+JSON.stringify(d.detail) : ''));
+      alert('Login failed: ' + (d.error||'Unknown error'));
+      btn.disabled = false;
+      btn.textContent = 'Login with SessionKey';
     }
-  } catch(e) { alert(e.message); }
+  } catch(e) {
+    alert('Error: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Login with SessionKey';
+  }
 }
 
 async function fetchLimits() {

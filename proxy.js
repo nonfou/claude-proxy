@@ -165,115 +165,124 @@ function httpsRequest(urlStr, options, postData) {
   });
 }
 
-// --- OAuth Flow Reverse Proxy (proxies claude.ai login pages through server) ---
-function oauthFlowProxy(clientReq, clientRes) {
-  var targetPath = clientReq.url.slice('/oauth-flow'.length) || '/';
+// --- SessionKey-based OAuth (programmatic, no browser needed) ---
+// Chrome-like headers to avoid Cloudflare challenge
+var BROWSER_HEADERS = {
+  'accept': 'application/json',
+  'accept-language': 'en-US,en;q=0.9',
+  'cache-control': 'no-cache',
+  'content-type': 'application/json',
+  'origin': 'https://claude.ai',
+  'referer': 'https://claude.ai/',
+  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+};
 
-  var bodyChunks = [];
-  clientReq.on('data', function(c) { bodyChunks.push(c); });
-  clientReq.on('end', function() {
-    var body = Buffer.concat(bodyChunks);
-
-    // Build headers for upstream claude.ai
-    var headers = {};
-    for (var key in clientReq.headers) {
-      if (key === 'host' || key === 'accept-encoding') continue;
-      headers[key] = clientReq.headers[key];
-    }
-    headers['host'] = 'claude.ai';
-    headers['accept-encoding'] = 'identity'; // Disable compression for URL rewriting
-
-    // Rewrite referer/origin to look like claude.ai
-    if (headers['referer']) {
-      headers['referer'] = headers['referer'].replace(/http:\/\/[^\/]+\/oauth-flow/g, 'https://claude.ai');
-    }
-    if (headers['origin']) {
-      headers['origin'] = 'https://claude.ai';
-    }
-
-    if (body.length > 0) {
-      headers['content-length'] = String(body.length);
-    }
-
+// Step 1: Get organization UUID using sessionKey cookie
+function getOrganizationUUID(sessionKey) {
+  return new Promise(function(resolve, reject) {
     var opts = {
       hostname: 'claude.ai',
       port: 443,
-      path: targetPath,
-      method: clientReq.method,
-      headers: headers,
+      path: '/api/organizations',
+      method: 'GET',
+      headers: Object.assign({}, BROWSER_HEADERS, {
+        'cookie': 'sessionKey=' + sessionKey,
+      }),
     };
-
-    var proxyReq = https.request(opts, function(proxyRes) {
-      var resHeaders = {};
-      for (var key in proxyRes.headers) {
-        resHeaders[key] = proxyRes.headers[key];
-      }
-
-      // Rewrite Location headers (redirects)
-      if (resHeaders['location']) {
-        var loc = resHeaders['location'];
-        if (loc.startsWith(OAUTH_REDIRECT_URI)) {
-          // OAuth callback! Auto-intercept and exchange code
-          var cbUrl = new URL(loc);
-          var code = cbUrl.searchParams.get('code') || '';
-          var state = cbUrl.searchParams.get('state') || '';
-          resHeaders['location'] = '/auth-oauth-auto-callback?code=' + encodeURIComponent(code) + '&state=' + encodeURIComponent(state);
-        } else if (loc.startsWith('https://claude.ai/')) {
-          resHeaders['location'] = '/oauth-flow/' + loc.slice('https://claude.ai/'.length);
-        } else if (loc.startsWith('https://claude.ai')) {
-          resHeaders['location'] = '/oauth-flow' + loc.slice('https://claude.ai'.length);
-        } else if (loc.startsWith('/')) {
-          resHeaders['location'] = '/oauth-flow' + loc;
+    delete opts.headers['content-type'];
+    var req = https.request(opts, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var body = Buffer.concat(chunks).toString();
+        if (res.statusCode !== 200) {
+          reject(new Error('Get organizations failed: HTTP ' + res.statusCode + ' - ' + body.substring(0, 200)));
+          return;
         }
-        // External redirects (Google SSO etc.) pass through as-is
-      }
-
-      // Rewrite Set-Cookie: remove domain restriction, Secure flag, adjust SameSite
-      if (resHeaders['set-cookie']) {
-        var cookies = Array.isArray(resHeaders['set-cookie']) ? resHeaders['set-cookie'] : [resHeaders['set-cookie']];
-        resHeaders['set-cookie'] = cookies.map(function(c) {
-          return c
-            .replace(/;\s*[Dd]omain=[^;]*/g, '')
-            .replace(/;\s*[Ss]ecure/g, '')
-            .replace(/;\s*[Ss]ame[Ss]ite=[^;]*/g, '; SameSite=Lax');
-        });
-      }
-
-      // Strip security headers that block proxied content
-      delete resHeaders['content-security-policy'];
-      delete resHeaders['content-security-policy-report-only'];
-      delete resHeaders['strict-transport-security'];
-      delete resHeaders['x-frame-options'];
-
-      // For text content, rewrite absolute claude.ai URLs
-      var ct = (resHeaders['content-type'] || '').toLowerCase();
-      if (ct.includes('text/html') || ct.includes('javascript') || ct.includes('application/json')) {
-        delete resHeaders['content-length'];
-        var chunks = [];
-        proxyRes.on('data', function(c) { chunks.push(c); });
-        proxyRes.on('end', function() {
-          var text = Buffer.concat(chunks).toString('utf-8');
-          text = text.replace(/https:\/\/claude\.ai\//g, '/oauth-flow/');
-          text = text.replace(/https:\/\/claude\.ai(?=["'\s<\)])/g, '/oauth-flow');
-          clientRes.writeHead(proxyRes.statusCode, resHeaders);
-          clientRes.end(text);
-        });
-      } else {
-        // Binary/other: pass through
-        clientRes.writeHead(proxyRes.statusCode, resHeaders);
-        proxyRes.pipe(clientRes);
-      }
+        try {
+          var orgs = JSON.parse(body);
+          if (!Array.isArray(orgs) || orgs.length === 0) {
+            reject(new Error('No organizations found'));
+            return;
+          }
+          // Prefer team org, otherwise use first
+          var org = orgs.find(function(o) { return o.raven_type === 'team'; }) || orgs[0];
+          console.log('[oauth] Step 1 OK: org=' + org.name + ' uuid=' + org.uuid);
+          resolve(org.uuid);
+        } catch (e) {
+          reject(new Error('Failed to parse organizations: ' + e.message));
+        }
+      });
     });
+    req.on('error', reject);
+    req.end();
+  });
+}
 
-    proxyReq.on('error', function(err) {
-      if (!clientRes.headersSent) {
-        clientRes.writeHead(502, { 'content-type': 'application/json' });
-        clientRes.end(JSON.stringify({ error: 'OAuth proxy error', message: err.message }));
-      }
+// Step 2: Get authorization code using sessionKey + PKCE
+function getAuthorizationCode(sessionKey, orgUUID) {
+  var codeVerifier = generateCodeVerifier();
+  var codeChallenge = generateCodeChallenge(codeVerifier);
+  var state = generateState();
+
+  // Save PKCE session for Step 3
+  oauthSession.state = state;
+  oauthSession.codeVerifier = codeVerifier;
+  oauthSession.createdAt = Date.now();
+
+  var postBody = JSON.stringify({
+    response_type: 'code',
+    client_id: OAUTH_CLIENT_ID,
+    organization_uuid: orgUUID,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    scope: OAUTH_SCOPE,
+    state: state,
+    code_challenge: codeChallenge,
+    code_challenge_method: 'S256',
+  });
+
+  return new Promise(function(resolve, reject) {
+    var opts = {
+      hostname: 'claude.ai',
+      port: 443,
+      path: '/v1/oauth/' + orgUUID + '/authorize',
+      method: 'POST',
+      headers: Object.assign({}, BROWSER_HEADERS, {
+        'cookie': 'sessionKey=' + sessionKey,
+        'content-length': String(Buffer.byteLength(postBody)),
+      }),
+    };
+    var req = https.request(opts, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var body = Buffer.concat(chunks).toString();
+        if (res.statusCode !== 200) {
+          reject(new Error('Get auth code failed: HTTP ' + res.statusCode + ' - ' + body.substring(0, 200)));
+          return;
+        }
+        try {
+          var result = JSON.parse(body);
+          if (!result.redirect_uri) {
+            reject(new Error('No redirect_uri in response'));
+            return;
+          }
+          var parsedUrl = new URL(result.redirect_uri);
+          var code = parsedUrl.searchParams.get('code');
+          if (!code) {
+            reject(new Error('No code in redirect_uri'));
+            return;
+          }
+          console.log('[oauth] Step 2 OK: got authorization code');
+          resolve(code);
+        } catch (e) {
+          reject(new Error('Failed to parse auth response: ' + e.message));
+        }
+      });
     });
-
-    if (body.length > 0) proxyReq.write(body);
-    proxyReq.end();
+    req.on('error', reject);
+    req.write(postBody);
+    req.end();
   });
 }
 
@@ -577,57 +586,37 @@ var server = http.createServer(function(clientReq, clientRes) {
     return;
   }
 
-  // OAuth login entry: generate PKCE and redirect to proxied claude.ai auth page
-  if (clientReq.method === 'GET' && clientReq.url === '/oauth-login') {
-    var cv = generateCodeVerifier();
-    var cc = generateCodeChallenge(cv);
-    var st = generateState();
-    oauthSession.state = st;
-    oauthSession.codeVerifier = cv;
-    oauthSession.createdAt = Date.now();
-
-    var params = new URLSearchParams({
-      response_type: 'code',
-      client_id: OAUTH_CLIENT_ID,
-      redirect_uri: OAUTH_REDIRECT_URI,
-      scope: OAUTH_SCOPE,
-      state: st,
-      code_challenge: cc,
-      code_challenge_method: 'S256',
-    });
-
-    console.log('[oauth] Starting proxied OAuth flow, state=' + st);
-    clientRes.writeHead(302, { 'location': '/oauth-flow/oauth/authorize?' + params.toString() });
-    clientRes.end();
-    return;
-  }
-
-  // OAuth flow reverse proxy (proxy claude.ai login pages through server)
-  if (clientReq.url.startsWith('/oauth-flow/') || clientReq.url === '/oauth-flow') {
-    oauthFlowProxy(clientReq, clientRes);
-    return;
-  }
-
-  // Auto-callback: intercept OAuth redirect, exchange code, redirect to dashboard
-  if (clientReq.method === 'GET' && clientReq.url.startsWith('/auth-oauth-auto-callback')) {
-    var cbParams = new URL('http://localhost' + clientReq.url);
-    var autoCode = cbParams.searchParams.get('code');
-    if (!autoCode || !oauthSession.codeVerifier) {
-      clientRes.writeHead(302, { 'location': '/?login=error&msg=missing_code_or_session' });
-      clientRes.end();
-      return;
-    }
-    console.log('[oauth] Auto-exchanging code for token...');
-    exchangeCodeForToken(autoCode).then(function(result) {
-      if (result.ok) {
-        clientRes.writeHead(302, { 'location': '/?login=success' });
-      } else {
-        clientRes.writeHead(302, { 'location': '/?login=error&msg=' + encodeURIComponent(result.error) });
+  // SessionKey login: user provides claude.ai sessionKey, server does full OAuth programmatically
+  if (clientReq.method === 'POST' && clientReq.url === '/auth-session-login') {
+    var chunks = [];
+    clientReq.on('data', function(c) { chunks.push(c); });
+    clientReq.on('end', function() {
+      try {
+        var body = JSON.parse(Buffer.concat(chunks).toString());
+        var sessionKey = body.sessionKey;
+        if (!sessionKey) {
+          clientRes.writeHead(400, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify({ ok: false, error: 'Missing sessionKey' }));
+          return;
+        }
+        console.log('[oauth] SessionKey login started...');
+        getOrganizationUUID(sessionKey).then(function(orgUUID) {
+          return getAuthorizationCode(sessionKey, orgUUID);
+        }).then(function(code) {
+          console.log('[oauth] Step 3: Exchanging code for token...');
+          return exchangeCodeForToken(code);
+        }).then(function(result) {
+          clientRes.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify(result));
+        }).catch(function(err) {
+          console.error('[oauth] SessionKey login failed:', err.message);
+          clientRes.writeHead(500, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify({ ok: false, error: err.message }));
+        });
+      } catch (e) {
+        clientRes.writeHead(400, { 'content-type': 'application/json' });
+        clientRes.end(JSON.stringify({ ok: false, error: 'Invalid request body' }));
       }
-      clientRes.end();
-    }).catch(function(err) {
-      clientRes.writeHead(302, { 'location': '/?login=error&msg=' + encodeURIComponent(err.message) });
-      clientRes.end();
     });
     return;
   }
