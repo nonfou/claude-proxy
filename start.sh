@@ -11,6 +11,6 @@ if [ -f "$PID_FILE" ]; then
   rm -f "$PID_FILE"
 fi
 
-nohup node "$SCRIPT_DIR/proxy.js" > "$SCRIPT_DIR/proxy.log" 2>&1 &
+nohup python3 "$SCRIPT_DIR/proxy.py" > "$SCRIPT_DIR/proxy.log" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Proxy started (PID: $(cat "$PID_FILE")), log: $SCRIPT_DIR/proxy.log"
