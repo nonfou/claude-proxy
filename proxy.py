@@ -4,6 +4,7 @@
 Transparent proxy for Claude API. Supports API Key and OAuth token modes.
 Uses curl_cffi to bypass Cloudflare TLS fingerprinting for claude.ai OAuth.
 """
+from __future__ import annotations
 
 import asyncio
 import base64
