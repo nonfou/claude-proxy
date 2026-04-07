@@ -8,30 +8,49 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #333; padding: 24px; }
   h1 { font-size: 22px; margin-bottom: 24px; color: #1a1a1a; }
-  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1100px; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; max-width: 1400px; }
   .card { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
   .card h2 { font-size: 16px; color: #555; margin-bottom: 14px; display: flex; align-items: center; justify-content: space-between; }
+  .card h2 .btns { display: flex; gap: 6px; }
   .card h2 button { font-size: 13px; padding: 4px 14px; border: 1px solid #d0d0d0; border-radius: 6px; background: #fff; cursor: pointer; color: #555; }
   .card h2 button:hover { background: #f0f0f0; }
   .card h2 button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: #4a90d9 !important; color: #fff !important; border-color: #3a7bc8 !important; }
+  .btn-primary:hover { background: #3a7bc8 !important; }
+  .btn-danger { background: #d9534f !important; color: #fff !important; border-color: #c9302c !important; }
+  .btn-danger:hover { background: #c9302c !important; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
   th { color: #888; font-weight: 500; font-size: 13px; }
-  td { color: #333; }
+  td { color: #333; word-break: break-all; }
   .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
   .tag-green { background: #e6f7e6; color: #2a7a2a; }
   .tag-yellow { background: #fff7e0; color: #8a6d00; }
   .tag-red { background: #fde8e8; color: #a33; }
+  .tag-blue { background: #e6f0ff; color: #2a5a9a; }
+  .tag-gray { background: #f0f0f0; color: #666; }
   .empty { color: #aaa; font-size: 14px; padding: 30px 0; text-align: center; }
   .model-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; }
   .model-item { padding: 7px 10px; background: #f8f8f8; border-radius: 6px; font-size: 13px; font-family: monospace; }
   .updated { font-size: 12px; color: #aaa; margin-top: 12px; }
+  .login-box { margin-top: 14px; padding: 14px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e0e0e0; }
+  .login-box .url-link { display: block; margin: 10px 0; padding: 10px; background: #fff; border: 1px solid #d0d0d0; border-radius: 6px; word-break: break-all; font-size: 13px; }
+  .login-box .url-link a { color: #4a90d9; text-decoration: none; }
+  .login-box .url-link a:hover { text-decoration: underline; }
+  .login-box .status-msg { font-size: 13px; color: #666; margin-top: 8px; }
+  .login-box .output-log { margin-top: 8px; padding: 8px; background: #1a1a1a; color: #ccc; border-radius: 6px; font-family: monospace; font-size: 12px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
+  @media (max-width: 1024px) { .cards { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 768px) { .cards { grid-template-columns: 1fr; } .model-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <h1>Claude API Proxy Dashboard</h1>
 <div class="cards">
+  <div class="card">
+    <h2>Auth Status<div class="btns"><button id="btn-login" onclick="startLogin()" class="btn-primary">Login</button><button id="btn-auth" onclick="fetchAuth()">Refresh</button></div></h2>
+    <div id="auth-content"><div class="empty">Loading...</div></div>
+    <div id="login-content"></div>
+  </div>
   <div class="card">
     <h2>Speed Limits<button id="btn-limits" onclick="fetchLimits()">Refresh</button></h2>
     <div id="limits-content"><div class="empty">Loading...</div></div>
@@ -43,7 +62,9 @@
   </div>
 </div>
 <script>
-const LABELS = {
+var loginPollTimer = null;
+
+var LABELS = {
   'anthropic-ratelimit-requests-limit': ['Requests Limit', '/min'],
   'anthropic-ratelimit-requests-remaining': ['Requests Remaining', ''],
   'anthropic-ratelimit-requests-reset': ['Requests Reset', ''],
@@ -66,63 +87,190 @@ function pct(remaining, limit) {
 
 function pctTag(val) {
   if (val === null) return '';
-  const cls = val > 50 ? 'tag-green' : val > 20 ? 'tag-yellow' : 'tag-red';
-  return `<span class="tag ${cls}">${val}%</span>`;
+  var cls = val > 50 ? 'tag-green' : val > 20 ? 'tag-yellow' : 'tag-red';
+  return '<span class="tag ' + cls + '">' + val + '%</span>';
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function fetchAuth() {
+  var btn = document.getElementById('btn-auth');
+  btn.disabled = true;
+  try {
+    var res = await fetch('/auth-status');
+    var d = await res.json();
+    var el = document.getElementById('auth-content');
+    var modeTag;
+    if (d.mode === 'apikey') {
+      modeTag = '<span class="tag tag-blue">API Key</span>';
+    } else if (d.mode === 'oauth') {
+      modeTag = '<span class="tag tag-green">OAuth Token</span>';
+    } else {
+      modeTag = '<span class="tag tag-gray">Not Configured</span>';
+    }
+    var rows = '<tr><td>Mode</td><td>' + modeTag + '</td></tr>' +
+      '<tr><td>Source</td><td>' + escHtml(d.source) + '</td></tr>' +
+      '<tr><td>Token</td><td><code>' + escHtml(d.tokenMasked) + '</code></td></tr>' +
+      '<tr><td>Header</td><td><code>' + escHtml(d.headerName) + '</code></td></tr>';
+    if (d.lastReadAt) {
+      rows += '<tr><td>Last Refresh</td><td>' + new Date(d.lastReadAt).toLocaleString() + '</td></tr>';
+    }
+    if (d.refreshInterval) {
+      rows += '<tr><td>Auto Refresh</td><td>Every ' + d.refreshInterval + 's</td></tr>';
+    }
+    if (d.lastError) {
+      rows += '<tr><td>Error</td><td><span class="tag tag-red">' + escHtml(d.lastError) + '</span></td></tr>';
+    }
+    el.innerHTML = '<table><tr><th>Property</th><th>Value</th></tr>' + rows + '</table>';
+    // Show/hide login button based on mode
+    document.getElementById('btn-login').style.display = (d.mode === 'none' || d.mode === 'oauth') ? '' : 'none';
+  } catch (e) {
+    document.getElementById('auth-content').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function startLogin() {
+  var btn = document.getElementById('btn-login');
+  btn.disabled = true;
+  try {
+    var res = await fetch('/auth-login', { method: 'POST' });
+    var d = await res.json();
+    if (!d.ok) {
+      alert('Login failed: ' + (d.error || 'Unknown error'));
+      btn.disabled = false;
+      return;
+    }
+    // Start polling for login status
+    updateLoginUI({ status: 'running', authUrl: null, error: null, output: '' });
+    pollLoginStatus();
+  } catch (e) {
+    alert('Error: ' + e.message);
+    btn.disabled = false;
+  }
+}
+
+async function cancelLogin() {
+  try {
+    await fetch('/auth-login-cancel', { method: 'POST' });
+  } catch (e) { /* ignore */ }
+  stopLoginPoll();
+  document.getElementById('login-content').innerHTML = '';
+  document.getElementById('btn-login').disabled = false;
+}
+
+function pollLoginStatus() {
+  if (loginPollTimer) clearInterval(loginPollTimer);
+  loginPollTimer = setInterval(async function() {
+    try {
+      var res = await fetch('/auth-login-status');
+      var d = await res.json();
+      updateLoginUI(d);
+      if (d.status === 'completed' || d.status === 'failed' || d.status === 'idle') {
+        stopLoginPoll();
+        if (d.status === 'completed') {
+          document.getElementById('btn-login').disabled = false;
+          fetchAuth(); // Refresh auth display
+        } else {
+          document.getElementById('btn-login').disabled = false;
+        }
+      }
+    } catch (e) {
+      stopLoginPoll();
+      document.getElementById('btn-login').disabled = false;
+    }
+  }, 2000);
+}
+
+function stopLoginPoll() {
+  if (loginPollTimer) { clearInterval(loginPollTimer); loginPollTimer = null; }
+}
+
+function updateLoginUI(d) {
+  var el = document.getElementById('login-content');
+  var html = '<div class="login-box">';
+
+  if (d.status === 'running') {
+    html += '<div style="display:flex;align-items:center;justify-content:space-between"><strong>Login in progress...</strong><button onclick="cancelLogin()" class="btn-danger" style="font-size:12px;padding:2px 10px">Cancel</button></div>';
+    if (d.authUrl) {
+      html += '<div class="url-link"><a href="' + escHtml(d.authUrl) + '" target="_blank">' + escHtml(d.authUrl) + '</a></div>';
+      html += '<div class="status-msg">Please open the URL above in your browser to complete authorization.</div>';
+    } else {
+      html += '<div class="status-msg">Waiting for authorization URL...</div>';
+    }
+  } else if (d.status === 'completed') {
+    html += '<div><span class="tag tag-green">Login Successful</span></div>';
+    html += '<div class="status-msg">Token has been saved and loaded.</div>';
+  } else if (d.status === 'failed') {
+    html += '<div><span class="tag tag-red">Login Failed</span></div>';
+    if (d.error) html += '<div class="status-msg">' + escHtml(d.error) + '</div>';
+  }
+
+  if (d.output) {
+    html += '<div class="output-log">' + escHtml(d.output) + '</div>';
+  }
+
+  html += '</div>';
+  el.innerHTML = html;
 }
 
 async function fetchLimits() {
-  const btn = document.getElementById('btn-limits');
+  var btn = document.getElementById('btn-limits');
   btn.disabled = true;
   try {
-    const res = await fetch('/rate-limits');
-    const data = await res.json();
-    const el = document.getElementById('limits-content');
-    const upd = document.getElementById('limits-updated');
+    var res = await fetch('/rate-limits');
+    var data = await res.json();
+    var el = document.getElementById('limits-content');
+    var upd = document.getElementById('limits-updated');
     if (!data.updatedAt) {
       el.innerHTML = '<div class="empty">No data yet. Send an API request first.</div>';
       upd.textContent = '';
       return;
     }
-    const h = data.headers;
-    const rows = Object.keys(LABELS).filter(k => h[k] !== undefined).map(k => {
-      const [label, unit] = LABELS[k];
-      let extra = '';
+    var h = data.headers;
+    var rows = Object.keys(LABELS).filter(function(k) { return h[k] !== undefined; }).map(function(k) {
+      var label = LABELS[k][0], unit = LABELS[k][1];
+      var extra = '';
       if (k.endsWith('-remaining')) {
-        const limitKey = k.replace('-remaining', '-limit');
+        var limitKey = k.replace('-remaining', '-limit');
         extra = pctTag(pct(h[k], h[limitKey]));
       }
-      const val = k.endsWith('-reset') ? new Date(h[k]).toLocaleTimeString() : h[k] + unit;
-      return `<tr><td>${label}</td><td>${val} ${extra}</td></tr>`;
+      var val = k.endsWith('-reset') ? new Date(h[k]).toLocaleTimeString() : h[k] + unit;
+      return '<tr><td>' + label + '</td><td>' + val + ' ' + extra + '</td></tr>';
     }).join('');
-    el.innerHTML = rows ? `<table><tr><th>Metric</th><th>Value</th></tr>${rows}</table>` : '<div class="empty">No rate limit headers found.</div>';
+    el.innerHTML = rows ? '<table><tr><th>Metric</th><th>Value</th></tr>' + rows + '</table>' : '<div class="empty">No rate limit headers found.</div>';
     upd.textContent = 'Updated: ' + new Date(data.updatedAt).toLocaleString();
   } catch (e) {
-    document.getElementById('limits-content').innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+    document.getElementById('limits-content').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
   } finally {
     btn.disabled = false;
   }
 }
 
 async function fetchModels() {
-  const btn = document.getElementById('btn-models');
+  var btn = document.getElementById('btn-models');
   btn.disabled = true;
   try {
-    const res = await fetch('/v1/models', { headers: { 'anthropic-version': '2023-06-01' } });
-    const data = await res.json();
-    const el = document.getElementById('models-content');
-    const models = (data.data || []).map(m => m.id).sort();
+    var res = await fetch('/v1/models', { headers: { 'anthropic-version': '2023-06-01' } });
+    var data = await res.json();
+    var el = document.getElementById('models-content');
+    var models = (data.data || []).map(function(m) { return m.id; }).sort();
     if (models.length === 0) {
       el.innerHTML = '<div class="empty">No models found.</div>';
       return;
     }
-    el.innerHTML = '<div class="model-grid">' + models.map(m => `<div class="model-item">${m}</div>`).join('') + '</div>';
+    el.innerHTML = '<div class="model-grid">' + models.map(function(m) { return '<div class="model-item">' + m + '</div>'; }).join('') + '</div>';
   } catch (e) {
-    document.getElementById('models-content').innerHTML = `<div class="empty">Error: ${e.message}</div>`;
+    document.getElementById('models-content').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
   } finally {
     btn.disabled = false;
   }
 }
 
+fetchAuth();
 fetchLimits();
 fetchModels();
 </script>
