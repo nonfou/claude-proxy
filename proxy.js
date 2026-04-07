@@ -5,7 +5,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { URL } = require('url');
-const { execFile } = require('child_process');
+// child_process.spawn used in claudeAiRequest()
 
 // Load .env file (zero-dependency, no need for dotenv package)
 const envPath = path.join(__dirname, '.env');
@@ -166,44 +166,60 @@ function httpsRequest(urlStr, options, postData) {
   });
 }
 
-// --- SessionKey-based OAuth (programmatic, via curl to bypass Cloudflare TLS fingerprinting) ---
+// --- SessionKey-based OAuth (via Python curl_cffi to bypass Cloudflare TLS fingerprinting) ---
 
-// Generic curl-based request to claude.ai (avoids Cloudflare blocking Node.js TLS fingerprint)
+// Call Python helper that uses curl_cffi (Chrome TLS impersonation)
 function claudeAiRequest(method, urlPath, sessionKey, body) {
   return new Promise(function(resolve, reject) {
     var url = 'https://claude.ai' + urlPath;
-    var args = [
-      '-s',                                // silent
-      '-w', '\n__CURL_HTTP_CODE__%{http_code}', // append status code
-      '-X', method,
-      '-H', 'accept: application/json',
-      '-H', 'accept-language: en-US,en;q=0.9',
-      '-H', 'cache-control: no-cache',
-      '-H', 'origin: https://claude.ai',
-      '-H', 'referer: https://claude.ai/',
-      '-H', 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-      '-H', 'cookie: sessionKey=' + sessionKey,
-    ];
-    if (body) {
-      args.push('-H', 'content-type: application/json');
-      args.push('-d', body);
-    }
-    args.push(url);
+    var reqData = JSON.stringify({
+      method: method,
+      url: url,
+      headers: {
+        'accept': 'application/json',
+        'accept-language': 'en-US,en;q=0.9',
+        'cache-control': 'no-cache',
+        'content-type': 'application/json',
+        'origin': 'https://claude.ai',
+        'referer': 'https://claude.ai/',
+      },
+      cookies: { sessionKey: sessionKey },
+      data: body || null,
+    });
 
-    execFile('curl', args, { maxBuffer: 10 * 1024 * 1024, timeout: 30000 }, function(err, stdout, stderr) {
-      if (err) {
-        reject(new Error('curl failed: ' + (stderr || err.message)));
+    var scriptPath = path.join(__dirname, 'oauth_helper.py');
+    var proc = require('child_process').spawn('python3', [scriptPath], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 60000,
+    });
+
+    var stdout = '';
+    var stderr = '';
+    proc.stdout.on('data', function(d) { stdout += d; });
+    proc.stderr.on('data', function(d) { stderr += d; });
+
+    proc.on('close', function(code) {
+      if (stderr) console.log('[oauth_helper] ' + stderr.trim());
+      if (code !== 0) {
+        reject(new Error('Python helper failed (exit ' + code + '). Make sure python3 and curl_cffi are available. ' + stderr.substring(0, 300)));
         return;
       }
-      var parts = stdout.split('\n__CURL_HTTP_CODE__');
-      var responseBody = parts[0];
-      var statusCode = parseInt(parts[1] || '0', 10);
       try {
-        resolve({ status: statusCode, body: JSON.parse(responseBody) });
+        var result = JSON.parse(stdout);
+        if (result.error) {
+          reject(new Error(result.error));
+          return;
+        }
+        var respBody;
+        try { respBody = JSON.parse(result.body); } catch(e) { respBody = result.body; }
+        resolve({ status: result.status, body: respBody });
       } catch (e) {
-        resolve({ status: statusCode, body: responseBody });
+        reject(new Error('Failed to parse helper output: ' + stdout.substring(0, 200)));
       }
     });
+
+    proc.stdin.write(reqData);
+    proc.stdin.end();
   });
 }
 
