@@ -79,7 +79,7 @@ BROWSER_HEADERS = {
     'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
 }
 
-CHROME_IMPERSONATE = 'chrome146'
+CHROME_IMPERSONATE = 'chrome131'
 
 PORT = int(os.environ.get('PORT', '3456'))
 TARGET_URL = os.environ.get('TARGET_URL', 'https://api.anthropic.com')
