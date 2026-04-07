@@ -175,12 +175,24 @@ function startLogin() {
   loginState.error = null;
   loginState.startedAt = new Date().toISOString();
 
+  // Pre-create ~/.claude/settings.json to skip onboarding wizard
+  const claudeDir = path.join(os.homedir(), '.claude');
+  const settingsPath = path.join(claudeDir, 'settings.json');
+  if (!fs.existsSync(settingsPath)) {
+    try {
+      if (!fs.existsSync(claudeDir)) fs.mkdirSync(claudeDir, { recursive: true });
+      fs.writeFileSync(settingsPath, '{}', 'utf-8');
+      console.log('[login] Created ' + settingsPath + ' to skip onboarding');
+    } catch (e) {
+      console.warn('[login] Failed to create settings.json: ' + e.message);
+    }
+  }
+
   const claudeCmd = findClaudeCommand();
   const claudeArgs = claudeCmd === 'npx' ? '--yes @anthropic-ai/claude-code' : '';
   const fullCmd = (claudeCmd + ' ' + claudeArgs).trim();
 
   // Use 'script' to wrap in a PTY so claude starts the interactive REPL
-  // Linux: script -qfc "claude" /dev/null
   const cmd = 'script';
   const args = ['-qfc', fullCmd, '/dev/null'];
 
@@ -193,7 +205,6 @@ function startLogin() {
 
   loginState.process = child;
   let loginSent = false;
-  let inputCount = 0; // track how many auto-inputs we've sent
 
   function sendInput(text, label) {
     if (loginState.process) {
@@ -206,40 +217,11 @@ function startLogin() {
     const text = data.toString();
     loginState.output += text;
     const cleaned = text.replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '').replace(/\x07/g, '').trim();
-    if (cleaned) console.log('[login] ' + cleaned.substring(0, 200));
+    if (cleaned) console.log('[login] ' + cleaned.substring(0, 300));
 
-    // Auto-respond to onboarding prompts (theme selection, etc.)
-    // Detect numbered menu items like "1." "2." "3." with selection prompt
     if (!loginSent) {
-      // Theme or option selection: send "1" + Enter to pick first option
-      if (/\d+\.\s*(Dark|Light|Monokai|Solarized|Custom)/i.test(text) ||
-          /choose|select|pick/i.test(text)) {
-        if (inputCount < 5) { // safety limit
-          inputCount++;
-          setTimeout(function() { sendInput('1\n', 'option 1 (onboarding)'); }, 500);
-          return;
-        }
-      }
-      // Yes/No or confirmation prompt
-      if (/\(y\/n\)|yes\/no|accept|agree|continue/i.test(text)) {
-        if (inputCount < 5) {
-          inputCount++;
-          setTimeout(function() { sendInput('y\n', 'yes (onboarding)'); }, 500);
-          return;
-        }
-      }
-      // Enter to continue
-      if (/press enter|press return|hit enter/i.test(text)) {
-        if (inputCount < 5) {
-          inputCount++;
-          setTimeout(function() { sendInput('\n', 'Enter (onboarding)'); }, 500);
-          return;
-        }
-      }
-      // REPL is ready: detect prompt character or "not logged in"
-      if (/not logged in|\/login/i.test(text) ||
-          /^[>\$%]\s*$/m.test(cleaned) ||
-          /claude\s*>\s*$/i.test(cleaned)) {
+      // Detect "not logged in" or REPL prompt → send /login
+      if (/not logged in|\/login/i.test(cleaned)) {
         loginSent = true;
         setTimeout(function() { sendInput('/login\n', '/login'); }, 1000);
       }
