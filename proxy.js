@@ -3,8 +3,8 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 const { URL } = require('url');
-const { spawn } = require('child_process');
 
 // Load .env file (zero-dependency, no need for dotenv package)
 const envPath = path.join(__dirname, '.env');
@@ -20,17 +20,39 @@ if (fs.existsSync(envPath)) {
   }
 }
 
+// --- OAuth Constants (from Anthropic/Claude Code) ---
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_AUTH_URL = 'https://claude.ai/oauth/authorize';
+const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
+const OAUTH_REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback';
+const OAUTH_SCOPE = 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload';
+const ANTHROPIC_BETA_HEADER = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-1m-2025-08-07,fast-mode-2026-02-01';
+// Required beta flags for OAuth mode (must always be present)
+const OAUTH_REQUIRED_BETAS = ['claude-code-20250219', 'oauth-2025-04-20'];
+
 // --- Auth State ---
 const auth = {
-  mode: null,          // 'apikey' | 'oauth'
-  token: null,         // The current token value
-  source: null,        // 'env:ANTHROPIC_API_KEY' | 'env:ANTHROPIC_AUTH_TOKEN' | 'file:<path>'
+  mode: null,          // 'apikey' | 'oauth' | 'none'
+  token: null,         // Current access token
+  refreshToken: null,  // OAuth refresh token
+  expiresAt: null,     // Token expiry timestamp (ms)
+  source: null,        // 'env:ANTHROPIC_API_KEY' | 'env:ANTHROPIC_AUTH_TOKEN' | 'file:<path>' | 'oauth'
   headerName: null,    // 'x-api-key' | 'authorization'
   headerValue: null,   // The full header value
-  filePath: null,      // If reading from file, the resolved absolute path
-  lastReadAt: null,    // ISO timestamp of last file read
-  lastError: null,     // Last error message (if any)
+  filePath: null,      // If reading from file
+  lastReadAt: null,
+  lastError: null,
 };
+
+// --- OAuth Session (for PKCE flow) ---
+const oauthSession = {
+  state: null,
+  codeVerifier: null,
+  createdAt: null,
+};
+
+// --- Token persistence path ---
+const TOKEN_FILE = path.join(__dirname, '.oauth-token.json');
 
 function resolveHomePath(p) {
   if (p.startsWith('~')) return path.join(os.homedir(), p.slice(1));
@@ -39,9 +61,9 @@ function resolveHomePath(p) {
 
 function readTokenFromFile(filePath) {
   try {
-    const content = fs.readFileSync(filePath, 'utf-8');
-    const settings = JSON.parse(content);
-    const token = settings && settings.env && settings.env.ANTHROPIC_AUTH_TOKEN;
+    var content = fs.readFileSync(filePath, 'utf-8');
+    var settings = JSON.parse(content);
+    var token = settings && settings.env && settings.env.ANTHROPIC_AUTH_TOKEN;
     if (!token) return { token: null, error: 'ANTHROPIC_AUTH_TOKEN not found in ' + filePath };
     return { token, error: null };
   } catch (err) {
@@ -49,20 +71,50 @@ function readTokenFromFile(filePath) {
   }
 }
 
+function loadOAuthToken() {
+  try {
+    var content = fs.readFileSync(TOKEN_FILE, 'utf-8');
+    var data = JSON.parse(content);
+    if (data.access_token) {
+      auth.mode = 'oauth';
+      auth.token = data.access_token;
+      auth.refreshToken = data.refresh_token || null;
+      auth.expiresAt = data.expires_at || null;
+      auth.source = 'oauth';
+      auth.headerName = 'authorization';
+      auth.headerValue = 'Bearer ' + data.access_token;
+      auth.lastReadAt = new Date().toISOString();
+      auth.lastError = null;
+      console.log('[auth] OAuth token loaded from ' + TOKEN_FILE);
+      return true;
+    }
+  } catch (e) { /* file doesn't exist */ }
+  return false;
+}
+
+function saveOAuthToken(data) {
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    console.log('[auth] OAuth token saved to ' + TOKEN_FILE);
+  } catch (e) {
+    console.error('[auth] Failed to save token: ' + e.message);
+  }
+}
+
 function refreshAuth() {
-  if (!auth.filePath) return false;
-  const { token, error } = readTokenFromFile(auth.filePath);
-  if (error) {
-    auth.lastError = error;
-    console.error('[auth] ' + error);
+  if (auth.filePath) {
+    var result = readTokenFromFile(auth.filePath);
+    if (!result.error) {
+      auth.token = result.token;
+      auth.headerValue = auth.headerName === 'x-api-key' ? result.token : 'Bearer ' + result.token;
+      auth.lastReadAt = new Date().toISOString();
+      auth.lastError = null;
+      return true;
+    }
+    auth.lastError = result.error;
     return false;
   }
-  auth.token = token;
-  auth.headerValue = auth.headerName === 'x-api-key' ? token : 'Bearer ' + token;
-  auth.lastReadAt = new Date().toISOString();
-  auth.lastError = null;
-  console.log('[auth] Token refreshed from ' + auth.filePath);
-  return true;
+  return false;
 }
 
 function maskToken(token) {
@@ -71,12 +123,91 @@ function maskToken(token) {
   return '****';
 }
 
+// --- PKCE helpers ---
+function generateCodeVerifier() {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
+function generateCodeChallenge(verifier) {
+  return crypto.createHash('sha256').update(verifier).digest('base64url');
+}
+
+function generateState() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+// --- HTTPS request helper (zero-dependency) ---
+function httpsRequest(urlStr, options, postData) {
+  return new Promise(function(resolve, reject) {
+    var url = new URL(urlStr);
+    var opts = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: options.method || 'POST',
+      headers: options.headers || {},
+    };
+    var req = https.request(opts, function(res) {
+      var chunks = [];
+      res.on('data', function(c) { chunks.push(c); });
+      res.on('end', function() {
+        var body = Buffer.concat(chunks).toString();
+        try {
+          resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(body) });
+        } catch (e) {
+          resolve({ status: res.statusCode, headers: res.headers, body: body });
+        }
+      });
+    });
+    req.on('error', reject);
+    if (postData) req.write(postData);
+    req.end();
+  });
+}
+
+// --- OAuth Token Refresh ---
+function refreshOAuthToken() {
+  if (!auth.refreshToken) return Promise.resolve(false);
+  console.log('[auth] Refreshing OAuth token...');
+  var postData = JSON.stringify({
+    grant_type: 'refresh_token',
+    refresh_token: auth.refreshToken,
+    client_id: OAUTH_CLIENT_ID,
+  });
+  return httpsRequest(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(postData) },
+  }, postData).then(function(res) {
+    if (res.status === 200 && res.body.access_token) {
+      var data = res.body;
+      auth.token = data.access_token;
+      auth.refreshToken = data.refresh_token || auth.refreshToken;
+      auth.expiresAt = data.expires_at ? data.expires_at * 1000 : (Date.now() + (data.expires_in || 3600) * 1000);
+      auth.headerValue = 'Bearer ' + data.access_token;
+      auth.lastReadAt = new Date().toISOString();
+      auth.lastError = null;
+      saveOAuthToken({
+        access_token: auth.token,
+        refresh_token: auth.refreshToken,
+        expires_at: auth.expiresAt,
+      });
+      console.log('[auth] OAuth token refreshed: ' + maskToken(auth.token));
+      return true;
+    }
+    console.error('[auth] Token refresh failed: ' + JSON.stringify(res.body));
+    return false;
+  }).catch(function(err) {
+    console.error('[auth] Token refresh error: ' + err.message);
+    return false;
+  });
+}
+
 // --- Auth Initialization ---
-const envApiKey = process.env.ANTHROPIC_API_KEY;
-const envAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
-const envCredFile = process.env.CLAUDE_CREDENTIALS_FILE;
-const envHeaderName = process.env.AUTH_HEADER_NAME;
-const refreshInterval = parseInt(process.env.TOKEN_REFRESH_INTERVAL || '0', 10);
+var envApiKey = process.env.ANTHROPIC_API_KEY;
+var envAuthToken = process.env.ANTHROPIC_AUTH_TOKEN;
+var envCredFile = process.env.CLAUDE_CREDENTIALS_FILE;
+var envHeaderName = process.env.AUTH_HEADER_NAME;
+var refreshInterval = parseInt(process.env.TOKEN_REFRESH_INTERVAL || '0', 10);
 
 if (envApiKey) {
   auth.mode = 'apikey';
@@ -90,48 +221,49 @@ if (envApiKey) {
   auth.source = 'env:ANTHROPIC_AUTH_TOKEN';
   auth.headerName = (envHeaderName || 'authorization').toLowerCase();
   auth.headerValue = auth.headerName === 'x-api-key' ? envAuthToken : 'Bearer ' + envAuthToken;
+} else if (loadOAuthToken()) {
+  // Loaded from .oauth-token.json
 } else {
-  const credPath = resolveHomePath(envCredFile || '~/.claude/settings.json');
-  const { token, error } = readTokenFromFile(credPath);
-  if (error) {
-    console.warn('Warning: No auth credentials found. Use Dashboard to login.');
-    console.warn('  Detail: ' + error);
-    // Start in unauthenticated mode - allow login from Dashboard
-    auth.mode = 'none';
-    auth.source = 'none';
-    auth.filePath = credPath;
-    auth.headerName = (envHeaderName || 'authorization').toLowerCase();
-    auth.lastError = error;
-  } else {
+  var credPath = resolveHomePath(envCredFile || '~/.claude/settings.json');
+  var credResult = readTokenFromFile(credPath);
+  if (!credResult.error) {
     auth.mode = 'oauth';
-    auth.token = token;
+    auth.token = credResult.token;
     auth.source = 'file:' + credPath;
     auth.filePath = credPath;
     auth.headerName = (envHeaderName || 'authorization').toLowerCase();
-    auth.headerValue = auth.headerName === 'x-api-key' ? token : 'Bearer ' + token;
+    auth.headerValue = auth.headerName === 'x-api-key' ? credResult.token : 'Bearer ' + credResult.token;
     auth.lastReadAt = new Date().toISOString();
+  } else {
+    console.warn('Warning: No auth credentials found. Use Dashboard to login.');
+    auth.mode = 'none';
+    auth.source = 'none';
+    auth.headerName = 'authorization';
+    auth.lastError = credResult.error;
   }
 }
 
-// Periodic refresh (only for file-based tokens)
-if (auth.filePath && refreshInterval > 0) {
-  setInterval(() => refreshAuth(), refreshInterval * 1000);
+// Periodic token refresh
+if (refreshInterval > 0) {
+  setInterval(function() {
+    if (auth.refreshToken) refreshOAuthToken();
+    else if (auth.filePath) refreshAuth();
+  }, refreshInterval * 1000);
 }
 
-const PORT = parseInt(process.env.PORT || '3456', 10);
-const TARGET_URL = process.env.TARGET_URL || 'https://api.anthropic.com';
-const target = new URL(TARGET_URL);
+var PORT = parseInt(process.env.PORT || '3456', 10);
+var TARGET_URL = process.env.TARGET_URL || 'https://api.anthropic.com';
+var target = new URL(TARGET_URL);
 
-// Cache for rate limit info extracted from upstream response headers
-const rateLimits = { updatedAt: null, headers: {} };
-
-const RATELIMIT_PREFIXES = ['anthropic-ratelimit-', 'retry-after'];
+// Cache for rate limit info
+var rateLimits = { updatedAt: null, headers: {} };
+var RATELIMIT_PREFIXES = ['anthropic-ratelimit-', 'retry-after'];
 
 function extractRateLimits(headers) {
-  const extracted = {};
-  for (const [key, value] of Object.entries(headers)) {
-    if (RATELIMIT_PREFIXES.some(p => key.startsWith(p))) {
-      extracted[key] = value;
+  var extracted = {};
+  for (var key in headers) {
+    if (RATELIMIT_PREFIXES.some(function(p) { return key.startsWith(p); })) {
+      extracted[key] = headers[key];
     }
   }
   if (Object.keys(extracted).length > 0) {
@@ -140,197 +272,30 @@ function extractRateLimits(headers) {
   }
 }
 
-// --- Login Process State ---
-const loginState = {
-  status: 'idle',    // 'idle' | 'running' | 'completed' | 'failed'
-  authUrl: null,     // Authorization URL to show in dashboard
-  output: '',        // Captured stdout/stderr
-  error: null,       // Error message if failed
-  startedAt: null,
-  process: null,     // Child process reference
-};
-
-function findClaudeCommand() {
-  // Check common locations
-  const candidates = ['claude'];
-  for (const cmd of candidates) {
-    try {
-      const { execSync } = require('child_process');
-      execSync((process.platform === 'win32' ? 'where ' : 'which ') + cmd, { stdio: 'ignore' });
-      return cmd;
-    } catch (e) { /* not found */ }
-  }
-  // Fallback to npx
-  return 'npx';
-}
-
-function startLogin() {
-  if (loginState.status === 'running') {
-    return { ok: false, error: 'Login already in progress' };
-  }
-
-  loginState.status = 'running';
-  loginState.authUrl = null;
-  loginState.output = '';
-  loginState.error = null;
-  loginState.startedAt = new Date().toISOString();
-
-  // Pre-create ~/.claude/settings.json to skip onboarding wizard
-  const claudeDir = path.join(os.homedir(), '.claude');
-  const settingsPath = path.join(claudeDir, 'settings.json');
-  if (!fs.existsSync(settingsPath)) {
-    try {
-      if (!fs.existsSync(claudeDir)) fs.mkdirSync(claudeDir, { recursive: true });
-      fs.writeFileSync(settingsPath, '{}', 'utf-8');
-      console.log('[login] Created ' + settingsPath + ' to skip onboarding');
-    } catch (e) {
-      console.warn('[login] Failed to create settings.json: ' + e.message);
-    }
-  }
-
-  const claudeCmd = findClaudeCommand();
-  const claudeArgs = claudeCmd === 'npx' ? '--yes @anthropic-ai/claude-code' : '';
-  const fullCmd = (claudeCmd + ' ' + claudeArgs).trim();
-
-  // Use 'script' to wrap in a PTY so claude starts the interactive REPL
-  const cmd = 'script';
-  const args = ['-qfc', fullCmd, '/dev/null'];
-
-  console.log('[login] Starting: ' + cmd + ' ' + args.join(' '));
-
-  const child = spawn(cmd, args, {
-    env: { ...process.env, BROWSER: 'none', NO_COLOR: '1', TERM: 'xterm' },
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-
-  loginState.process = child;
-  let loginSent = false;
-
-  function sendInput(text, label) {
-    if (loginState.process) {
-      console.log('[login] Sending: ' + label);
-      child.stdin.write(text);
-    }
-  }
-
-  function handleOutput(data) {
-    const text = data.toString();
-    loginState.output += text;
-    const cleaned = text.replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '').replace(/\x07/g, '').trim();
-    if (cleaned) console.log('[login] ' + cleaned.substring(0, 300));
-
-    if (!loginSent) {
-      // Detect "not logged in" or REPL prompt → send /login
-      if (/not logged in|\/login/i.test(cleaned)) {
-        loginSent = true;
-        setTimeout(function() { sendInput('/login\n', '/login'); }, 1000);
-      }
-    }
-
-    // Look for authorization URL in output
-    if (!loginState.authUrl) {
-      const lines = text.split(/[\r\n]+/);
-      for (const line of lines) {
-        const urlMatch = line.match(/https:\/\/[^\s\x1b\u001b\x07]+/);
-        if (urlMatch) {
-          var url = urlMatch[0]
-            .replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '')
-            .replace(/\x07/g, '')
-            .replace(/[)\]}>'"]+$/, '');
-          if (url.length > 20) {
-            loginState.authUrl = url;
-            console.log('[login] Auth URL found: ' + url);
-          }
-        }
-      }
-    }
-  }
-
-  child.stdout.on('data', handleOutput);
-  child.stderr.on('data', handleOutput);
-
-  // Fallback: send /login after a longer delay to allow onboarding to complete
-  setTimeout(function() {
-    if (!loginSent && loginState.process) {
-      loginSent = true;
-      console.log('[login] Fallback: sending /login command');
-      child.stdin.write('/login\n');
-    }
-  }, 15000);
-
-  child.on('close', function(code) {
-    loginState.process = null;
-    // Check if token file was created/updated regardless of exit code
-    if (auth.filePath) {
-      var result = readTokenFromFile(auth.filePath);
-      if (!result.error && result.token) {
-        loginState.status = 'completed';
-        auth.mode = 'oauth';
-        auth.token = result.token;
-        auth.source = 'file:' + auth.filePath;
-        auth.headerValue = auth.headerName === 'x-api-key' ? result.token : 'Bearer ' + result.token;
-        auth.lastReadAt = new Date().toISOString();
-        auth.lastError = null;
-        console.log('[login] Login completed, token loaded: ' + maskToken(result.token));
-        return;
-      }
-    }
-    if (code === 0) {
-      loginState.status = 'completed';
-      console.log('[login] Login process exited successfully');
-    } else {
-      loginState.status = 'failed';
-      loginState.error = 'Process exited with code ' + code + '. Try "Save Token" instead.';
-      console.error('[login] Failed: exit code ' + code);
-    }
-  });
-
-  child.on('error', function(err) {
-    loginState.process = null;
-    loginState.status = 'failed';
-    loginState.error = err.message + '. Try "Save Token" instead.';
-    console.error('[login] Error: ' + err.message);
-  });
-
-  return { ok: true };
-}
-
-function cancelLogin() {
-  if (loginState.process) {
-    loginState.process.kill();
-    loginState.process = null;
-    loginState.status = 'idle';
-    loginState.error = 'Cancelled by user';
-    return { ok: true };
-  }
-  return { ok: false, error: 'No login process running' };
-}
-
-// Proxy request with 401 retry for file-based OAuth
+// Proxy request with 401 retry
 function makeProxyRequest(options, body, clientRes, isRetry) {
-  const proxyReq = https.request(options, (proxyRes) => {
+  var proxyReq = https.request(options, function(proxyRes) {
     extractRateLimits(proxyRes.headers);
 
-    // On 401 + file-based OAuth + first attempt: try refreshing token
-    if (proxyRes.statusCode === 401 && auth.filePath && !isRetry) {
-      proxyRes.resume(); // drain the 401 response
+    if (proxyRes.statusCode === 401 && !isRetry) {
+      proxyRes.resume();
       console.log('[auth] Got 401, attempting token refresh...');
-      const refreshed = refreshAuth();
-      if (refreshed) {
-        options.headers[auth.headerName] = auth.headerValue;
-        makeProxyRequest(options, body, clientRes, true);
-        return;
-      }
-      console.log('[auth] Token refresh failed, forwarding 401 to client');
-      // Re-send the 401 - but we already drained the original response,
-      // so forward a synthetic 401
-      if (!clientRes.headersSent) {
-        clientRes.writeHead(401, { 'content-type': 'application/json' });
-        clientRes.end(JSON.stringify({
-          error: 'Unauthorized',
-          message: 'Token refresh failed. Run "claude login" on server to re-authenticate.',
-        }));
-      }
+      var refreshPromise = auth.refreshToken ? refreshOAuthToken() :
+        (auth.filePath ? Promise.resolve(refreshAuth()) : Promise.resolve(false));
+      refreshPromise.then(function(ok) {
+        if (ok) {
+          options.headers[auth.headerName] = auth.headerValue;
+          makeProxyRequest(options, body, clientRes, true);
+        } else {
+          if (!clientRes.headersSent) {
+            clientRes.writeHead(401, { 'content-type': 'application/json' });
+            clientRes.end(JSON.stringify({
+              error: 'Unauthorized',
+              message: 'Token refresh failed. Use Dashboard to re-login.',
+            }));
+          }
+        }
+      });
       return;
     }
 
@@ -338,7 +303,7 @@ function makeProxyRequest(options, body, clientRes, isRetry) {
     proxyRes.pipe(clientRes);
   });
 
-  proxyReq.on('error', (err) => {
+  proxyReq.on('error', function(err) {
     console.error('Upstream error:', err.message);
     if (!clientRes.headersSent) {
       clientRes.writeHead(502, { 'content-type': 'application/json' });
@@ -346,29 +311,28 @@ function makeProxyRequest(options, body, clientRes, isRetry) {
     }
   });
 
-  if (body.length > 0) {
-    proxyReq.write(body);
-  }
+  if (body.length > 0) proxyReq.write(body);
   proxyReq.end();
 }
 
-const server = http.createServer((clientReq, clientRes) => {
-  // Dashboard page
+// --- HTTP Server ---
+var server = http.createServer(function(clientReq, clientRes) {
+  // Dashboard
   if (clientReq.method === 'GET' && (clientReq.url === '/' || clientReq.url === '/dashboard')) {
-    const html = fs.readFileSync(path.join(__dirname, 'dashboard.html'), 'utf-8');
+    var html = fs.readFileSync(path.join(__dirname, 'dashboard.html'), 'utf-8');
     clientRes.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     clientRes.end(html);
     return;
   }
 
-  // Local rate-limits query endpoint
+  // Rate limits
   if (clientReq.method === 'GET' && clientReq.url === '/rate-limits') {
     clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     clientRes.end(JSON.stringify(rateLimits, null, 2));
     return;
   }
 
-  // Auth status endpoint
+  // Auth status
   if (clientReq.method === 'GET' && clientReq.url === '/auth-status') {
     clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
     clientRes.end(JSON.stringify({
@@ -376,108 +340,210 @@ const server = http.createServer((clientReq, clientRes) => {
       source: auth.source,
       headerName: auth.headerName,
       tokenMasked: maskToken(auth.token),
+      hasRefreshToken: !!auth.refreshToken,
+      expiresAt: auth.expiresAt ? new Date(auth.expiresAt).toISOString() : null,
       lastReadAt: auth.lastReadAt,
       lastError: auth.lastError,
-      refreshInterval: auth.filePath ? refreshInterval : null,
     }, null, 2));
     return;
   }
 
-  // Start login process
-  if (clientReq.method === 'POST' && clientReq.url === '/auth-login') {
-    const result = startLogin();
-    const code = result.ok ? 200 : 409;
-    clientRes.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
-    clientRes.end(JSON.stringify(result));
-    return;
-  }
+  // OAuth Step 1: Generate authorization URL
+  if (clientReq.method === 'POST' && clientReq.url === '/auth-oauth-start') {
+    var codeVerifier = generateCodeVerifier();
+    var codeChallenge = generateCodeChallenge(codeVerifier);
+    var state = generateState();
 
-  // Check login status
-  if (clientReq.method === 'GET' && clientReq.url === '/auth-login-status') {
+    oauthSession.state = state;
+    oauthSession.codeVerifier = codeVerifier;
+    oauthSession.createdAt = Date.now();
+
+    var params = new URLSearchParams({
+      response_type: 'code',
+      client_id: OAUTH_CLIENT_ID,
+      redirect_uri: OAUTH_REDIRECT_URI,
+      scope: OAUTH_SCOPE,
+      state: state,
+      code_challenge: codeChallenge,
+      code_challenge_method: 'S256',
+    });
+    var authUrl = OAUTH_AUTH_URL + '?' + params.toString();
+
+    console.log('[oauth] Auth URL generated, state=' + state);
     clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    clientRes.end(JSON.stringify({
-      status: loginState.status,
-      authUrl: loginState.authUrl,
-      error: loginState.error,
-      startedAt: loginState.startedAt,
-      output: loginState.output.slice(-2000), // last 2000 chars
-    }, null, 2));
+    clientRes.end(JSON.stringify({ ok: true, authUrl: authUrl }));
     return;
   }
 
-  // Cancel login process
-  if (clientReq.method === 'POST' && clientReq.url === '/auth-login-cancel') {
-    const result = cancelLogin();
-    clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    clientRes.end(JSON.stringify(result));
+  // OAuth Step 2: Exchange authorization code for token
+  if (clientReq.method === 'POST' && clientReq.url === '/auth-oauth-callback') {
+    var chunks = [];
+    clientReq.on('data', function(c) { chunks.push(c); });
+    clientReq.on('end', function() {
+      try {
+        var body = JSON.parse(Buffer.concat(chunks).toString());
+        var code = body.code;
+        if (!code) {
+          clientRes.writeHead(400, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify({ ok: false, error: 'Missing code parameter' }));
+          return;
+        }
+        if (!oauthSession.codeVerifier) {
+          clientRes.writeHead(400, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify({ ok: false, error: 'No OAuth session. Click Login first.' }));
+          return;
+        }
+
+        var postData = JSON.stringify({
+          grant_type: 'authorization_code',
+          code: code,
+          client_id: OAUTH_CLIENT_ID,
+          redirect_uri: OAUTH_REDIRECT_URI,
+          code_verifier: oauthSession.codeVerifier,
+        });
+
+        console.log('[oauth] Exchanging code for token...');
+        httpsRequest(OAUTH_TOKEN_URL, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'content-length': String(Buffer.byteLength(postData)),
+          },
+        }, postData).then(function(res) {
+          if (res.status === 200 && res.body.access_token) {
+            var data = res.body;
+            auth.mode = 'oauth';
+            auth.token = data.access_token;
+            auth.refreshToken = data.refresh_token || null;
+            auth.expiresAt = data.expires_at ? data.expires_at * 1000 : (Date.now() + (data.expires_in || 3600) * 1000);
+            auth.source = 'oauth';
+            auth.headerName = 'authorization';
+            auth.headerValue = 'Bearer ' + data.access_token;
+            auth.lastReadAt = new Date().toISOString();
+            auth.lastError = null;
+
+            saveOAuthToken({
+              access_token: data.access_token,
+              refresh_token: data.refresh_token,
+              expires_at: auth.expiresAt,
+            });
+
+            // Clear session
+            oauthSession.state = null;
+            oauthSession.codeVerifier = null;
+
+            console.log('[oauth] Login successful! Token: ' + maskToken(auth.token));
+            clientRes.writeHead(200, { 'content-type': 'application/json' });
+            clientRes.end(JSON.stringify({
+              ok: true,
+              token: maskToken(auth.token),
+              expiresAt: new Date(auth.expiresAt).toISOString(),
+            }));
+          } else {
+            console.error('[oauth] Token exchange failed:', JSON.stringify(res.body));
+            clientRes.writeHead(res.status || 400, { 'content-type': 'application/json' });
+            clientRes.end(JSON.stringify({
+              ok: false,
+              error: (res.body && res.body.error_description) || (res.body && res.body.error) || 'Token exchange failed',
+              detail: res.body,
+            }));
+          }
+        }).catch(function(err) {
+          console.error('[oauth] Token exchange error:', err.message);
+          clientRes.writeHead(500, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify({ ok: false, error: err.message }));
+        });
+      } catch (e) {
+        clientRes.writeHead(400, { 'content-type': 'application/json' });
+        clientRes.end(JSON.stringify({ ok: false, error: 'Invalid request body' }));
+      }
+    });
     return;
   }
 
-  // Refresh auth token from file
+  // Refresh token manually
   if (clientReq.method === 'POST' && clientReq.url === '/auth-refresh') {
-    const ok = refreshAuth();
-    clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    clientRes.end(JSON.stringify({ ok, token: maskToken(auth.token), error: auth.lastError }));
+    var p = auth.refreshToken ? refreshOAuthToken() :
+      (auth.filePath ? Promise.resolve(refreshAuth()) : Promise.resolve(false));
+    p.then(function(ok) {
+      clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      clientRes.end(JSON.stringify({ ok: ok, token: maskToken(auth.token), error: auth.lastError }));
+    });
     return;
   }
 
-  // Block API forwarding if not authenticated
+  // Block if not authenticated
   if (auth.mode === 'none') {
     clientRes.writeHead(503, { 'content-type': 'application/json; charset=utf-8' });
     clientRes.end(JSON.stringify({
       error: 'Service Unavailable',
-      message: 'No auth credentials configured. Use Dashboard to login.',
+      message: 'No auth credentials. Use Dashboard to login.',
     }));
     return;
   }
 
-  // Collect request body
-  const bodyChunks = [];
-  clientReq.on('data', chunk => bodyChunks.push(chunk));
-  clientReq.on('end', () => {
-    const body = Buffer.concat(bodyChunks);
+  // --- API Proxy ---
+  var bodyChunks = [];
+  clientReq.on('data', function(chunk) { bodyChunks.push(chunk); });
+  clientReq.on('end', function() {
+    var body = Buffer.concat(bodyChunks);
 
-    // Build forwarded headers: keep original, inject auth, fix host
-    const fwdHeaders = { ...clientReq.headers };
-    delete fwdHeaders['host'];
-    delete fwdHeaders['x-api-key'];
-    delete fwdHeaders['authorization'];
-    fwdHeaders[auth.headerName] = auth.headerValue;
-    fwdHeaders['host'] = target.host;
+    // Check if token needs refresh before forwarding
+    var needsRefresh = auth.refreshToken && auth.expiresAt && (Date.now() > auth.expiresAt - 180000);
+    var preRefresh = needsRefresh ? refreshOAuthToken() : Promise.resolve(true);
 
-    // Recalculate content-length for the actual body
-    if (body.length > 0) {
-      fwdHeaders['content-length'] = String(body.length);
-    } else {
-      delete fwdHeaders['content-length'];
-    }
-    // Remove transfer-encoding to avoid conflicts
-    delete fwdHeaders['transfer-encoding'];
+    preRefresh.then(function() {
+      var fwdHeaders = {};
+      // Copy original headers
+      for (var key in clientReq.headers) {
+        if (key !== 'host' && key !== 'x-api-key' && key !== 'authorization') {
+          fwdHeaders[key] = clientReq.headers[key];
+        }
+      }
+      // Inject auth
+      fwdHeaders[auth.headerName] = auth.headerValue;
+      fwdHeaders['host'] = target.host;
+      // Inject/merge anthropic-beta header for OAuth mode
+      if (auth.mode === 'oauth') {
+        if (!fwdHeaders['anthropic-beta']) {
+          fwdHeaders['anthropic-beta'] = ANTHROPIC_BETA_HEADER;
+        } else {
+          // Client sent its own beta header; ensure OAuth-required betas are present
+          var existing = fwdHeaders['anthropic-beta'].split(',').map(function(s){return s.trim();});
+          OAUTH_REQUIRED_BETAS.forEach(function(b) {
+            if (existing.indexOf(b) === -1) existing.push(b);
+          });
+          fwdHeaders['anthropic-beta'] = existing.join(',');
+        }
+      }
 
-    const options = {
-      hostname: target.hostname,
-      port: target.port || 443,
-      path: clientReq.url,
-      method: clientReq.method,
-      headers: fwdHeaders,
-    };
+      if (body.length > 0) {
+        fwdHeaders['content-length'] = String(body.length);
+      } else {
+        delete fwdHeaders['content-length'];
+      }
+      delete fwdHeaders['transfer-encoding'];
 
-    makeProxyRequest(options, body, clientRes, false);
+      var options = {
+        hostname: target.hostname,
+        port: target.port || 443,
+        path: clientReq.url,
+        method: clientReq.method,
+        headers: fwdHeaders,
+      };
+
+      makeProxyRequest(options, body, clientRes, false);
+    });
   });
 
-  clientReq.on('error', (err) => {
+  clientReq.on('error', function(err) {
     console.error('Client request error:', err.message);
   });
 });
 
-server.listen(PORT, '0.0.0.0', () => {
+server.listen(PORT, '0.0.0.0', function() {
   console.log('Claude API proxy listening on http://0.0.0.0:' + PORT);
   console.log('Forwarding to ' + TARGET_URL);
   console.log('Auth: ' + auth.mode + ' (' + auth.source + ') token=' + maskToken(auth.token));
-  if (auth.filePath && refreshInterval > 0) {
-    console.log('Token auto-refresh every ' + refreshInterval + 's');
-  }
   console.log('Dashboard: http://localhost:' + PORT + '/');
-  console.log('Rate limits: GET http://localhost:' + PORT + '/rate-limits');
-  console.log('Auth status: GET http://localhost:' + PORT + '/auth-status');
 });

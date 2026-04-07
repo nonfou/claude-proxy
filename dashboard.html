@@ -17,8 +17,6 @@
   .card h2 button:disabled { opacity: 0.5; cursor: not-allowed; }
   .btn-primary { background: #4a90d9 !important; color: #fff !important; border-color: #3a7bc8 !important; }
   .btn-primary:hover { background: #3a7bc8 !important; }
-  .btn-danger { background: #d9534f !important; color: #fff !important; border-color: #c9302c !important; }
-  .btn-danger:hover { background: #c9302c !important; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; }
   th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #eee; }
   th { color: #888; font-weight: 500; font-size: 13px; }
@@ -33,12 +31,14 @@
   .model-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; }
   .model-item { padding: 7px 10px; background: #f8f8f8; border-radius: 6px; font-size: 13px; font-family: monospace; }
   .updated { font-size: 12px; color: #aaa; margin-top: 12px; }
-  .login-box { margin-top: 14px; padding: 14px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e0e0e0; }
-  .login-box .url-link { display: block; margin: 10px 0; padding: 10px; background: #fff; border: 1px solid #d0d0d0; border-radius: 6px; word-break: break-all; font-size: 13px; }
-  .login-box .url-link a { color: #4a90d9; text-decoration: none; }
-  .login-box .url-link a:hover { text-decoration: underline; }
-  .login-box .status-msg { font-size: 13px; color: #666; margin-top: 8px; }
-  .login-box .output-log { margin-top: 8px; padding: 8px; background: #1a1a1a; color: #ccc; border-radius: 6px; font-family: monospace; font-size: 12px; max-height: 120px; overflow-y: auto; white-space: pre-wrap; }
+  .oauth-box { margin-top: 14px; padding: 14px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e0e0e0; }
+  .oauth-box .step { margin-bottom: 12px; }
+  .oauth-box .step-num { display: inline-block; width: 24px; height: 24px; line-height: 24px; text-align: center; background: #4a90d9; color: #fff; border-radius: 50%; font-size: 12px; margin-right: 8px; }
+  .oauth-box .step-done { background: #2a7a2a; }
+  .oauth-box input[type="text"] { width: 100%; padding: 8px 10px; border: 1px solid #d0d0d0; border-radius: 6px; font-size: 13px; font-family: monospace; margin: 6px 0; }
+  .oauth-box .hint { font-size: 12px; color: #999; margin-top: 4px; }
+  .oauth-box a { color: #4a90d9; text-decoration: none; word-break: break-all; }
+  .oauth-box a:hover { text-decoration: underline; }
   @media (max-width: 1024px) { .cards { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 768px) { .cards { grid-template-columns: 1fr; } .model-grid { grid-template-columns: 1fr; } }
 </style>
@@ -47,9 +47,9 @@
 <h1>Claude API Proxy Dashboard</h1>
 <div class="cards">
   <div class="card">
-    <h2>Auth Status<div class="btns"><button id="btn-login" onclick="startLogin()" class="btn-primary">Login</button><button id="btn-auth" onclick="fetchAuth()">Refresh</button></div></h2>
+    <h2>Auth Status<div class="btns"><button id="btn-login" onclick="startOAuth()" class="btn-primary">Login</button><button id="btn-auth" onclick="fetchAuth()">Refresh</button></div></h2>
     <div id="auth-content"><div class="empty">Loading...</div></div>
-    <div id="login-content"></div>
+    <div id="oauth-content"></div>
   </div>
   <div class="card">
     <h2>Speed Limits<button id="btn-limits" onclick="fetchLimits()">Refresh</button></h2>
@@ -62,8 +62,6 @@
   </div>
 </div>
 <script>
-var loginPollTimer = null;
-
 var LABELS = {
   'anthropic-ratelimit-requests-limit': ['Requests Limit', '/min'],
   'anthropic-ratelimit-requests-remaining': ['Requests Remaining', ''],
@@ -80,199 +78,122 @@ var LABELS = {
   'retry-after': ['Retry After', 's']
 };
 
-function pct(remaining, limit) {
-  if (!remaining || !limit) return null;
-  return Math.round((parseInt(remaining) / parseInt(limit)) * 100);
-}
-
-function pctTag(val) {
-  if (val === null) return '';
-  var cls = val > 50 ? 'tag-green' : val > 20 ? 'tag-yellow' : 'tag-red';
-  return '<span class="tag ' + cls + '">' + val + '%</span>';
-}
-
-function escHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
+function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function pct(r,l) { if(!r||!l)return null; return Math.round((parseInt(r)/parseInt(l))*100); }
+function pctTag(v) { if(v===null)return''; var c=v>50?'tag-green':v>20?'tag-yellow':'tag-red'; return '<span class="tag '+c+'">'+v+'%</span>'; }
 
 async function fetchAuth() {
-  var btn = document.getElementById('btn-auth');
-  btn.disabled = true;
+  document.getElementById('btn-auth').disabled = true;
   try {
     var res = await fetch('/auth-status');
     var d = await res.json();
     var el = document.getElementById('auth-content');
-    var modeTag;
-    if (d.mode === 'apikey') {
-      modeTag = '<span class="tag tag-blue">API Key</span>';
-    } else if (d.mode === 'oauth') {
-      modeTag = '<span class="tag tag-green">OAuth Token</span>';
-    } else {
-      modeTag = '<span class="tag tag-gray">Not Configured</span>';
-    }
-    var rows = '<tr><td>Mode</td><td>' + modeTag + '</td></tr>' +
-      '<tr><td>Source</td><td>' + escHtml(d.source) + '</td></tr>' +
-      '<tr><td>Token</td><td><code>' + escHtml(d.tokenMasked) + '</code></td></tr>' +
-      '<tr><td>Header</td><td><code>' + escHtml(d.headerName) + '</code></td></tr>';
-    if (d.lastReadAt) {
-      rows += '<tr><td>Last Refresh</td><td>' + new Date(d.lastReadAt).toLocaleString() + '</td></tr>';
-    }
-    if (d.refreshInterval) {
-      rows += '<tr><td>Auto Refresh</td><td>Every ' + d.refreshInterval + 's</td></tr>';
-    }
-    if (d.lastError) {
-      rows += '<tr><td>Error</td><td><span class="tag tag-red">' + escHtml(d.lastError) + '</span></td></tr>';
-    }
-    el.innerHTML = '<table><tr><th>Property</th><th>Value</th></tr>' + rows + '</table>';
-    // Show/hide login button based on mode
-    document.getElementById('btn-login').style.display = (d.mode === 'none' || d.mode === 'oauth') ? '' : 'none';
-  } catch (e) {
-    document.getElementById('auth-content').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
-  } finally {
-    btn.disabled = false;
-  }
+    var modeTag = d.mode==='apikey' ? '<span class="tag tag-blue">API Key</span>'
+      : d.mode==='oauth' ? '<span class="tag tag-green">OAuth</span>'
+      : '<span class="tag tag-gray">Not Configured</span>';
+    var rows = '<tr><td>Mode</td><td>'+modeTag+'</td></tr>'
+      +'<tr><td>Source</td><td>'+esc(d.source)+'</td></tr>'
+      +'<tr><td>Token</td><td><code>'+esc(d.tokenMasked)+'</code></td></tr>';
+    if (d.expiresAt) rows += '<tr><td>Expires</td><td>'+new Date(d.expiresAt).toLocaleString()+'</td></tr>';
+    if (d.hasRefreshToken) rows += '<tr><td>Refresh</td><td><span class="tag tag-green">Available</span></td></tr>';
+    if (d.lastReadAt) rows += '<tr><td>Last Update</td><td>'+new Date(d.lastReadAt).toLocaleString()+'</td></tr>';
+    if (d.lastError) rows += '<tr><td>Error</td><td><span class="tag tag-red">'+esc(d.lastError)+'</span></td></tr>';
+    el.innerHTML = '<table><tr><th>Property</th><th>Value</th></tr>'+rows+'</table>';
+  } catch(e) {
+    document.getElementById('auth-content').innerHTML = '<div class="empty">Error: '+e.message+'</div>';
+  } finally { document.getElementById('btn-auth').disabled = false; }
 }
 
-async function startLogin() {
-  var btn = document.getElementById('btn-login');
-  btn.disabled = true;
+async function startOAuth() {
+  document.getElementById('btn-login').disabled = true;
   try {
-    var res = await fetch('/auth-login', { method: 'POST' });
+    var res = await fetch('/auth-oauth-start', { method: 'POST' });
     var d = await res.json();
-    if (!d.ok) {
-      alert('Login failed: ' + (d.error || 'Unknown error'));
-      btn.disabled = false;
-      return;
-    }
-    // Start polling for login status
-    updateLoginUI({ status: 'running', authUrl: null, error: null, output: '' });
-    pollLoginStatus();
-  } catch (e) {
-    alert('Error: ' + e.message);
-    btn.disabled = false;
-  }
+    if (!d.ok) { alert(d.error||'Failed'); return; }
+    showOAuthStep2(d.authUrl);
+  } catch(e) { alert(e.message); }
+  finally { document.getElementById('btn-login').disabled = false; }
 }
 
-async function cancelLogin() {
-  try {
-    await fetch('/auth-login-cancel', { method: 'POST' });
-  } catch (e) { /* ignore */ }
-  stopLoginPoll();
-  document.getElementById('login-content').innerHTML = '';
-  document.getElementById('btn-login').disabled = false;
+function showOAuthStep2(authUrl) {
+  var el = document.getElementById('oauth-content');
+  el.innerHTML = '<div class="oauth-box">'
+    +'<div class="step"><span class="step-num step-done">1</span><strong>Authorization URL generated</strong></div>'
+    +'<div class="step"><span class="step-num">2</span><strong>Open this link to login:</strong><br>'
+    +'<a href="'+esc(authUrl)+'" target="_blank" id="oauth-url">'+esc(authUrl.substring(0,80))+'...</a></div>'
+    +'<div class="step"><span class="step-num">3</span><strong>After login, paste the callback URL or code:</strong><br>'
+    +'<input type="text" id="oauth-code-input" placeholder="Paste the full callback URL or just the code parameter">'
+    +'<div class="hint">After authorizing, you\'ll be redirected to a page. Copy the full URL from your browser\'s address bar and paste it here.</div>'
+    +'<button onclick="submitOAuthCode()" class="btn-primary" style="margin-top:8px;padding:6px 20px">Submit</button>'
+    +'</div></div>';
 }
 
-function pollLoginStatus() {
-  if (loginPollTimer) clearInterval(loginPollTimer);
-  loginPollTimer = setInterval(async function() {
+async function submitOAuthCode() {
+  var input = document.getElementById('oauth-code-input').value.trim();
+  if (!input) { alert('Please paste the callback URL or code'); return; }
+
+  // Extract code from URL or use raw input
+  var code = input;
+  if (input.startsWith('http')) {
     try {
-      var res = await fetch('/auth-login-status');
-      var d = await res.json();
-      updateLoginUI(d);
-      if (d.status === 'completed' || d.status === 'failed' || d.status === 'idle') {
-        stopLoginPoll();
-        if (d.status === 'completed') {
-          document.getElementById('btn-login').disabled = false;
-          fetchAuth(); // Refresh auth display
-        } else {
-          document.getElementById('btn-login').disabled = false;
-        }
-      }
-    } catch (e) {
-      stopLoginPoll();
-      document.getElementById('btn-login').disabled = false;
-    }
-  }, 2000);
-}
+      var url = new URL(input);
+      code = url.searchParams.get('code') || input;
+    } catch(e) { /* use raw */ }
+  }
 
-function stopLoginPoll() {
-  if (loginPollTimer) { clearInterval(loginPollTimer); loginPollTimer = null; }
-}
-
-function updateLoginUI(d) {
-  var el = document.getElementById('login-content');
-  var html = '<div class="login-box">';
-
-  if (d.status === 'running') {
-    html += '<div style="display:flex;align-items:center;justify-content:space-between"><strong>Login in progress...</strong><button onclick="cancelLogin()" class="btn-danger" style="font-size:12px;padding:2px 10px">Cancel</button></div>';
-    if (d.authUrl) {
-      html += '<div class="url-link"><a href="' + escHtml(d.authUrl) + '" target="_blank">' + escHtml(d.authUrl) + '</a></div>';
-      html += '<div class="status-msg">Please open the URL above in your browser to complete authorization.</div>';
+  try {
+    var res = await fetch('/auth-oauth-callback', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: code }),
+    });
+    var d = await res.json();
+    if (d.ok) {
+      document.getElementById('oauth-content').innerHTML = '<div class="oauth-box">'
+        +'<span class="tag tag-green">Login Successful!</span> Token: <code>'+esc(d.token)+'</code>'
+        +'<div class="hint">Expires: '+d.expiresAt+'</div></div>';
+      fetchAuth();
     } else {
-      html += '<div class="status-msg">Waiting for authorization URL...</div>';
+      alert('Error: ' + (d.error||'Unknown error') + (d.detail ? '\n\nDetail: '+JSON.stringify(d.detail) : ''));
     }
-  } else if (d.status === 'completed') {
-    html += '<div><span class="tag tag-green">Login Successful</span></div>';
-    html += '<div class="status-msg">Token has been saved and loaded.</div>';
-  } else if (d.status === 'failed') {
-    html += '<div><span class="tag tag-red">Login Failed</span></div>';
-    if (d.error) html += '<div class="status-msg">' + escHtml(d.error) + '</div>';
-  }
-
-  if (d.output) {
-    html += '<div class="output-log">' + escHtml(d.output) + '</div>';
-  }
-
-  html += '</div>';
-  el.innerHTML = html;
+  } catch(e) { alert(e.message); }
 }
 
 async function fetchLimits() {
-  var btn = document.getElementById('btn-limits');
-  btn.disabled = true;
+  document.getElementById('btn-limits').disabled = true;
   try {
     var res = await fetch('/rate-limits');
     var data = await res.json();
     var el = document.getElementById('limits-content');
     var upd = document.getElementById('limits-updated');
-    if (!data.updatedAt) {
-      el.innerHTML = '<div class="empty">No data yet. Send an API request first.</div>';
-      upd.textContent = '';
-      return;
-    }
+    if (!data.updatedAt) { el.innerHTML='<div class="empty">No data yet.</div>'; upd.textContent=''; return; }
     var h = data.headers;
-    var rows = Object.keys(LABELS).filter(function(k) { return h[k] !== undefined; }).map(function(k) {
-      var label = LABELS[k][0], unit = LABELS[k][1];
-      var extra = '';
-      if (k.endsWith('-remaining')) {
-        var limitKey = k.replace('-remaining', '-limit');
-        extra = pctTag(pct(h[k], h[limitKey]));
-      }
-      var val = k.endsWith('-reset') ? new Date(h[k]).toLocaleTimeString() : h[k] + unit;
-      return '<tr><td>' + label + '</td><td>' + val + ' ' + extra + '</td></tr>';
+    var rows = Object.keys(LABELS).filter(function(k){return h[k]!==undefined;}).map(function(k){
+      var label=LABELS[k][0],unit=LABELS[k][1],extra='';
+      if(k.endsWith('-remaining')){extra=pctTag(pct(h[k],h[k.replace('-remaining','-limit')]));}
+      var val=k.endsWith('-reset')?new Date(h[k]).toLocaleTimeString():h[k]+unit;
+      return '<tr><td>'+label+'</td><td>'+val+' '+extra+'</td></tr>';
     }).join('');
-    el.innerHTML = rows ? '<table><tr><th>Metric</th><th>Value</th></tr>' + rows + '</table>' : '<div class="empty">No rate limit headers found.</div>';
-    upd.textContent = 'Updated: ' + new Date(data.updatedAt).toLocaleString();
-  } catch (e) {
-    document.getElementById('limits-content').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
-  } finally {
-    btn.disabled = false;
-  }
+    el.innerHTML = rows ? '<table><tr><th>Metric</th><th>Value</th></tr>'+rows+'</table>' : '<div class="empty">No rate limit headers.</div>';
+    upd.textContent = 'Updated: '+new Date(data.updatedAt).toLocaleString();
+  } catch(e) { document.getElementById('limits-content').innerHTML='<div class="empty">Error: '+e.message+'</div>'; }
+  finally { document.getElementById('btn-limits').disabled = false; }
 }
 
 async function fetchModels() {
-  var btn = document.getElementById('btn-models');
-  btn.disabled = true;
+  document.getElementById('btn-models').disabled = true;
   try {
     var res = await fetch('/v1/models', { headers: { 'anthropic-version': '2023-06-01' } });
     var data = await res.json();
     var el = document.getElementById('models-content');
-    var models = (data.data || []).map(function(m) { return m.id; }).sort();
-    if (models.length === 0) {
-      el.innerHTML = '<div class="empty">No models found.</div>';
-      return;
-    }
-    el.innerHTML = '<div class="model-grid">' + models.map(function(m) { return '<div class="model-item">' + m + '</div>'; }).join('') + '</div>';
-  } catch (e) {
-    document.getElementById('models-content').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
-  } finally {
-    btn.disabled = false;
-  }
+    var models = (data.data||[]).map(function(m){return m.id;}).sort();
+    if (!models.length) { el.innerHTML='<div class="empty">No models found.</div>'; return; }
+    el.innerHTML = '<div class="model-grid">'+models.map(function(m){return '<div class="model-item">'+m+'</div>';}).join('')+'</div>';
+  } catch(e) { document.getElementById('models-content').innerHTML='<div class="empty">Error: '+e.message+'</div>'; }
+  finally { document.getElementById('btn-models').disabled = false; }
 }
 
-fetchAuth();
-fetchLimits();
-fetchModels();
+fetchAuth(); fetchLimits(); fetchModels();
 </script>
 </body>
 </html>
