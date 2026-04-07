@@ -175,16 +175,20 @@ function startLogin() {
   loginState.error = null;
   loginState.startedAt = new Date().toISOString();
 
-  const cmd = findClaudeCommand();
-  // claude REPL needs stdin for /login command; use 'claude' directly, not 'claude login'
-  const args = cmd === 'npx' ? ['--yes', '@anthropic-ai/claude-code'] : [];
+  const claudeCmd = findClaudeCommand();
+  const claudeArgs = claudeCmd === 'npx' ? '--yes @anthropic-ai/claude-code' : '';
+  const fullCmd = (claudeCmd + ' ' + claudeArgs).trim();
+
+  // Use 'script' to wrap in a PTY so claude starts the interactive REPL
+  // Linux: script -qfc "claude" /dev/null
+  const cmd = 'script';
+  const args = ['-qfc', fullCmd, '/dev/null'];
 
   console.log('[login] Starting: ' + cmd + ' ' + args.join(' '));
 
   const child = spawn(cmd, args, {
-    env: { ...process.env, BROWSER: 'none', NO_COLOR: '1', TERM: 'dumb' },
+    env: { ...process.env, BROWSER: 'none', NO_COLOR: '1', TERM: 'xterm' },
     stdio: ['pipe', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
   });
 
   loginState.process = child;
@@ -193,12 +197,12 @@ function startLogin() {
   function handleOutput(data) {
     const text = data.toString();
     loginState.output += text;
-    console.log('[login] ' + text.trim());
+    const cleaned = text.replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '').trim();
+    if (cleaned) console.log('[login] ' + cleaned);
 
     // When REPL is ready or prompts for login, send /login command
     if (!loginSent) {
-      // Look for signs the REPL is ready: prompt, "Not logged in", or any interactive indicator
-      if (/not logged in|\/login|>\s*$/i.test(text) || text.includes('$') || text.includes('%')) {
+      if (/not logged in|\/login|>\s*$|welcome|claude/i.test(text)) {
         loginSent = true;
         console.log('[login] Sending /login command to REPL');
         child.stdin.write('/login\n');
@@ -207,17 +211,15 @@ function startLogin() {
 
     // Look for authorization URL in output
     if (!loginState.authUrl) {
-      // Match URLs line by line to be more precise
       const lines = text.split(/[\r\n]+/);
       for (const line of lines) {
-        const urlMatch = line.match(/https:\/\/[^\s\x1b\u001b]+/);
+        const urlMatch = line.match(/https:\/\/[^\s\x1b\u001b\x07]+/);
         if (urlMatch) {
-          // Clean ANSI escape codes and trailing punctuation
-          const url = urlMatch[0]
-            .replace(/\x1b\[[0-9;]*m/g, '')
+          var url = urlMatch[0]
             .replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '')
+            .replace(/\x07/g, '')
             .replace(/[)\]}>'"]+$/, '');
-          if (url.length > 20) { // ignore very short matches
+          if (url.length > 20) {
             loginState.authUrl = url;
             console.log('[login] Auth URL found: ' + url);
           }
@@ -230,7 +232,7 @@ function startLogin() {
   child.stderr.on('data', handleOutput);
 
   // Fallback: send /login after a delay if not auto-detected
-  setTimeout(() => {
+  setTimeout(function() {
     if (!loginSent && loginState.process) {
       loginSent = true;
       console.log('[login] Fallback: sending /login command');
@@ -238,20 +240,20 @@ function startLogin() {
     }
   }, 5000);
 
-  child.on('close', (code) => {
+  child.on('close', function(code) {
     loginState.process = null;
     // Check if token file was created/updated regardless of exit code
     if (auth.filePath) {
-      const { token, error } = readTokenFromFile(auth.filePath);
-      if (!error && token) {
+      var result = readTokenFromFile(auth.filePath);
+      if (!result.error && result.token) {
         loginState.status = 'completed';
         auth.mode = 'oauth';
-        auth.token = token;
+        auth.token = result.token;
         auth.source = 'file:' + auth.filePath;
-        auth.headerValue = auth.headerName === 'x-api-key' ? token : 'Bearer ' + token;
+        auth.headerValue = auth.headerName === 'x-api-key' ? result.token : 'Bearer ' + result.token;
         auth.lastReadAt = new Date().toISOString();
         auth.lastError = null;
-        console.log('[login] Login completed, token loaded: ' + maskToken(token));
+        console.log('[login] Login completed, token loaded: ' + maskToken(result.token));
         return;
       }
     }
@@ -260,15 +262,15 @@ function startLogin() {
       console.log('[login] Login process exited successfully');
     } else {
       loginState.status = 'failed';
-      loginState.error = 'Process exited with code ' + code;
+      loginState.error = 'Process exited with code ' + code + '. Try "Save Token" instead.';
       console.error('[login] Failed: exit code ' + code);
     }
   });
 
-  child.on('error', (err) => {
+  child.on('error', function(err) {
     loginState.process = null;
     loginState.status = 'failed';
-    loginState.error = err.message;
+    loginState.error = err.message + '. Try "Save Token" instead.';
     console.error('[login] Error: ' + err.message);
   });
 
