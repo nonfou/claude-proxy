@@ -165,6 +165,164 @@ function httpsRequest(urlStr, options, postData) {
   });
 }
 
+// --- OAuth Flow Reverse Proxy (proxies claude.ai login pages through server) ---
+function oauthFlowProxy(clientReq, clientRes) {
+  var targetPath = clientReq.url.slice('/oauth-flow'.length) || '/';
+
+  var bodyChunks = [];
+  clientReq.on('data', function(c) { bodyChunks.push(c); });
+  clientReq.on('end', function() {
+    var body = Buffer.concat(bodyChunks);
+
+    // Build headers for upstream claude.ai
+    var headers = {};
+    for (var key in clientReq.headers) {
+      if (key === 'host' || key === 'accept-encoding') continue;
+      headers[key] = clientReq.headers[key];
+    }
+    headers['host'] = 'claude.ai';
+    headers['accept-encoding'] = 'identity'; // Disable compression for URL rewriting
+
+    // Rewrite referer/origin to look like claude.ai
+    if (headers['referer']) {
+      headers['referer'] = headers['referer'].replace(/http:\/\/[^\/]+\/oauth-flow/g, 'https://claude.ai');
+    }
+    if (headers['origin']) {
+      headers['origin'] = 'https://claude.ai';
+    }
+
+    if (body.length > 0) {
+      headers['content-length'] = String(body.length);
+    }
+
+    var opts = {
+      hostname: 'claude.ai',
+      port: 443,
+      path: targetPath,
+      method: clientReq.method,
+      headers: headers,
+    };
+
+    var proxyReq = https.request(opts, function(proxyRes) {
+      var resHeaders = {};
+      for (var key in proxyRes.headers) {
+        resHeaders[key] = proxyRes.headers[key];
+      }
+
+      // Rewrite Location headers (redirects)
+      if (resHeaders['location']) {
+        var loc = resHeaders['location'];
+        if (loc.startsWith(OAUTH_REDIRECT_URI)) {
+          // OAuth callback! Auto-intercept and exchange code
+          var cbUrl = new URL(loc);
+          var code = cbUrl.searchParams.get('code') || '';
+          var state = cbUrl.searchParams.get('state') || '';
+          resHeaders['location'] = '/auth-oauth-auto-callback?code=' + encodeURIComponent(code) + '&state=' + encodeURIComponent(state);
+        } else if (loc.startsWith('https://claude.ai/')) {
+          resHeaders['location'] = '/oauth-flow/' + loc.slice('https://claude.ai/'.length);
+        } else if (loc.startsWith('https://claude.ai')) {
+          resHeaders['location'] = '/oauth-flow' + loc.slice('https://claude.ai'.length);
+        } else if (loc.startsWith('/')) {
+          resHeaders['location'] = '/oauth-flow' + loc;
+        }
+        // External redirects (Google SSO etc.) pass through as-is
+      }
+
+      // Rewrite Set-Cookie: remove domain restriction, Secure flag, adjust SameSite
+      if (resHeaders['set-cookie']) {
+        var cookies = Array.isArray(resHeaders['set-cookie']) ? resHeaders['set-cookie'] : [resHeaders['set-cookie']];
+        resHeaders['set-cookie'] = cookies.map(function(c) {
+          return c
+            .replace(/;\s*[Dd]omain=[^;]*/g, '')
+            .replace(/;\s*[Ss]ecure/g, '')
+            .replace(/;\s*[Ss]ame[Ss]ite=[^;]*/g, '; SameSite=Lax');
+        });
+      }
+
+      // Strip security headers that block proxied content
+      delete resHeaders['content-security-policy'];
+      delete resHeaders['content-security-policy-report-only'];
+      delete resHeaders['strict-transport-security'];
+      delete resHeaders['x-frame-options'];
+
+      // For text content, rewrite absolute claude.ai URLs
+      var ct = (resHeaders['content-type'] || '').toLowerCase();
+      if (ct.includes('text/html') || ct.includes('javascript') || ct.includes('application/json')) {
+        delete resHeaders['content-length'];
+        var chunks = [];
+        proxyRes.on('data', function(c) { chunks.push(c); });
+        proxyRes.on('end', function() {
+          var text = Buffer.concat(chunks).toString('utf-8');
+          text = text.replace(/https:\/\/claude\.ai\//g, '/oauth-flow/');
+          text = text.replace(/https:\/\/claude\.ai(?=["'\s<\)])/g, '/oauth-flow');
+          clientRes.writeHead(proxyRes.statusCode, resHeaders);
+          clientRes.end(text);
+        });
+      } else {
+        // Binary/other: pass through
+        clientRes.writeHead(proxyRes.statusCode, resHeaders);
+        proxyRes.pipe(clientRes);
+      }
+    });
+
+    proxyReq.on('error', function(err) {
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'content-type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: 'OAuth proxy error', message: err.message }));
+      }
+    });
+
+    if (body.length > 0) proxyReq.write(body);
+    proxyReq.end();
+  });
+}
+
+// Shared function: exchange authorization code for token and save
+function exchangeCodeForToken(code) {
+  var postData = JSON.stringify({
+    grant_type: 'authorization_code',
+    code: code,
+    client_id: OAUTH_CLIENT_ID,
+    redirect_uri: OAUTH_REDIRECT_URI,
+    code_verifier: oauthSession.codeVerifier,
+  });
+  return httpsRequest(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(postData)),
+    },
+  }, postData).then(function(res) {
+    if (res.status === 200 && res.body.access_token) {
+      var data = res.body;
+      auth.mode = 'oauth';
+      auth.token = data.access_token;
+      auth.refreshToken = data.refresh_token || null;
+      auth.expiresAt = data.expires_at ? data.expires_at * 1000 : (Date.now() + (data.expires_in || 3600) * 1000);
+      auth.source = 'oauth';
+      auth.headerName = 'authorization';
+      auth.headerValue = 'Bearer ' + data.access_token;
+      auth.lastReadAt = new Date().toISOString();
+      auth.lastError = null;
+      saveOAuthToken({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        expires_at: auth.expiresAt,
+      });
+      oauthSession.state = null;
+      oauthSession.codeVerifier = null;
+      console.log('[oauth] Login successful! Token: ' + maskToken(auth.token));
+      return { ok: true, token: maskToken(auth.token), expiresAt: new Date(auth.expiresAt).toISOString() };
+    }
+    console.error('[oauth] Token exchange failed:', JSON.stringify(res.body));
+    return {
+      ok: false,
+      error: (res.body && res.body.error_description) || (res.body && res.body.error) || 'Token exchange failed',
+      detail: res.body,
+    };
+  });
+}
+
 // --- OAuth Token Refresh ---
 function refreshOAuthToken() {
   if (!auth.refreshToken) return Promise.resolve(false);
@@ -375,7 +533,7 @@ var server = http.createServer(function(clientReq, clientRes) {
     return;
   }
 
-  // OAuth Step 2: Exchange authorization code for token
+  // OAuth Step 2: Exchange authorization code for token (manual paste fallback)
   if (clientReq.method === 'POST' && clientReq.url === '/auth-oauth-callback') {
     var chunks = [];
     clientReq.on('data', function(c) { chunks.push(c); });
@@ -393,63 +551,10 @@ var server = http.createServer(function(clientReq, clientRes) {
           clientRes.end(JSON.stringify({ ok: false, error: 'No OAuth session. Click Login first.' }));
           return;
         }
-
-        var postData = JSON.stringify({
-          grant_type: 'authorization_code',
-          code: code,
-          client_id: OAUTH_CLIENT_ID,
-          redirect_uri: OAUTH_REDIRECT_URI,
-          code_verifier: oauthSession.codeVerifier,
-        });
-
-        console.log('[oauth] Exchanging code for token...');
-        httpsRequest(OAUTH_TOKEN_URL, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'content-length': String(Buffer.byteLength(postData)),
-          },
-        }, postData).then(function(res) {
-          if (res.status === 200 && res.body.access_token) {
-            var data = res.body;
-            auth.mode = 'oauth';
-            auth.token = data.access_token;
-            auth.refreshToken = data.refresh_token || null;
-            auth.expiresAt = data.expires_at ? data.expires_at * 1000 : (Date.now() + (data.expires_in || 3600) * 1000);
-            auth.source = 'oauth';
-            auth.headerName = 'authorization';
-            auth.headerValue = 'Bearer ' + data.access_token;
-            auth.lastReadAt = new Date().toISOString();
-            auth.lastError = null;
-
-            saveOAuthToken({
-              access_token: data.access_token,
-              refresh_token: data.refresh_token,
-              expires_at: auth.expiresAt,
-            });
-
-            // Clear session
-            oauthSession.state = null;
-            oauthSession.codeVerifier = null;
-
-            console.log('[oauth] Login successful! Token: ' + maskToken(auth.token));
-            clientRes.writeHead(200, { 'content-type': 'application/json' });
-            clientRes.end(JSON.stringify({
-              ok: true,
-              token: maskToken(auth.token),
-              expiresAt: new Date(auth.expiresAt).toISOString(),
-            }));
-          } else {
-            console.error('[oauth] Token exchange failed:', JSON.stringify(res.body));
-            clientRes.writeHead(res.status || 400, { 'content-type': 'application/json' });
-            clientRes.end(JSON.stringify({
-              ok: false,
-              error: (res.body && res.body.error_description) || (res.body && res.body.error) || 'Token exchange failed',
-              detail: res.body,
-            }));
-          }
+        exchangeCodeForToken(code).then(function(result) {
+          clientRes.writeHead(result.ok ? 200 : 400, { 'content-type': 'application/json' });
+          clientRes.end(JSON.stringify(result));
         }).catch(function(err) {
-          console.error('[oauth] Token exchange error:', err.message);
           clientRes.writeHead(500, { 'content-type': 'application/json' });
           clientRes.end(JSON.stringify({ ok: false, error: err.message }));
         });
@@ -468,6 +573,61 @@ var server = http.createServer(function(clientReq, clientRes) {
     p.then(function(ok) {
       clientRes.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
       clientRes.end(JSON.stringify({ ok: ok, token: maskToken(auth.token), error: auth.lastError }));
+    });
+    return;
+  }
+
+  // OAuth login entry: generate PKCE and redirect to proxied claude.ai auth page
+  if (clientReq.method === 'GET' && clientReq.url === '/oauth-login') {
+    var cv = generateCodeVerifier();
+    var cc = generateCodeChallenge(cv);
+    var st = generateState();
+    oauthSession.state = st;
+    oauthSession.codeVerifier = cv;
+    oauthSession.createdAt = Date.now();
+
+    var params = new URLSearchParams({
+      response_type: 'code',
+      client_id: OAUTH_CLIENT_ID,
+      redirect_uri: OAUTH_REDIRECT_URI,
+      scope: OAUTH_SCOPE,
+      state: st,
+      code_challenge: cc,
+      code_challenge_method: 'S256',
+    });
+
+    console.log('[oauth] Starting proxied OAuth flow, state=' + st);
+    clientRes.writeHead(302, { 'location': '/oauth-flow/oauth/authorize?' + params.toString() });
+    clientRes.end();
+    return;
+  }
+
+  // OAuth flow reverse proxy (proxy claude.ai login pages through server)
+  if (clientReq.url.startsWith('/oauth-flow/') || clientReq.url === '/oauth-flow') {
+    oauthFlowProxy(clientReq, clientRes);
+    return;
+  }
+
+  // Auto-callback: intercept OAuth redirect, exchange code, redirect to dashboard
+  if (clientReq.method === 'GET' && clientReq.url.startsWith('/auth-oauth-auto-callback')) {
+    var cbParams = new URL('http://localhost' + clientReq.url);
+    var autoCode = cbParams.searchParams.get('code');
+    if (!autoCode || !oauthSession.codeVerifier) {
+      clientRes.writeHead(302, { 'location': '/?login=error&msg=missing_code_or_session' });
+      clientRes.end();
+      return;
+    }
+    console.log('[oauth] Auto-exchanging code for token...');
+    exchangeCodeForToken(autoCode).then(function(result) {
+      if (result.ok) {
+        clientRes.writeHead(302, { 'location': '/?login=success' });
+      } else {
+        clientRes.writeHead(302, { 'location': '/?login=error&msg=' + encodeURIComponent(result.error) });
+      }
+      clientRes.end();
+    }).catch(function(err) {
+      clientRes.writeHead(302, { 'location': '/?login=error&msg=' + encodeURIComponent(err.message) });
+      clientRes.end();
     });
     return;
   }

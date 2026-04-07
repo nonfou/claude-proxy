@@ -39,12 +39,18 @@
   .oauth-box .hint { font-size: 12px; color: #999; margin-top: 4px; }
   .oauth-box a { color: #4a90d9; text-decoration: none; word-break: break-all; }
   .oauth-box a:hover { text-decoration: underline; }
+  .alert-bar { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; display: none; }
+  .alert-success { background: #e6f7e6; color: #2a7a2a; border: 1px solid #b5e8b5; display: block; }
+  .alert-error { background: #fde8e8; color: #a33; border: 1px solid #f5c6c6; display: block; }
+  .link-btn { font-size: 12px; color: #4a90d9; cursor: pointer; background: none; border: none; text-decoration: underline; padding: 0; margin-top: 8px; }
+  .link-btn:hover { color: #2a5a9a; }
   @media (max-width: 1024px) { .cards { grid-template-columns: 1fr 1fr; } }
   @media (max-width: 768px) { .cards { grid-template-columns: 1fr; } .model-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
 <h1>Claude API Proxy Dashboard</h1>
+<div id="alert-bar" class="alert-bar"></div>
 <div class="cards">
   <div class="card">
     <h2>Auth Status<div class="btns"><button id="btn-login" onclick="startOAuth()" class="btn-primary">Login</button><button id="btn-auth" onclick="fetchAuth()">Refresh</button></div></h2>
@@ -82,6 +88,23 @@ function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 function pct(r,l) { if(!r||!l)return null; return Math.round((parseInt(r)/parseInt(l))*100); }
 function pctTag(v) { if(v===null)return''; var c=v>50?'tag-green':v>20?'tag-yellow':'tag-red'; return '<span class="tag '+c+'">'+v+'%</span>'; }
 
+// Check URL params for login result
+(function() {
+  var params = new URLSearchParams(window.location.search);
+  var login = params.get('login');
+  if (login === 'success') {
+    var bar = document.getElementById('alert-bar');
+    bar.className = 'alert-bar alert-success';
+    bar.textContent = 'Login successful! OAuth token has been saved.';
+    history.replaceState(null, '', '/');
+  } else if (login === 'error') {
+    var bar = document.getElementById('alert-bar');
+    bar.className = 'alert-bar alert-error';
+    bar.textContent = 'Login failed: ' + (params.get('msg') || 'Unknown error');
+    history.replaceState(null, '', '/');
+  }
+})();
+
 async function fetchAuth() {
   document.getElementById('btn-auth').disabled = true;
   try {
@@ -104,26 +127,30 @@ async function fetchAuth() {
   } finally { document.getElementById('btn-auth').disabled = false; }
 }
 
-async function startOAuth() {
-  document.getElementById('btn-login').disabled = true;
+// Primary login: redirect to server-side proxied OAuth flow
+function startOAuth() {
+  window.location.href = '/oauth-login';
+}
+
+// Fallback: manual paste flow
+async function startManualOAuth() {
   try {
     var res = await fetch('/auth-oauth-start', { method: 'POST' });
     var d = await res.json();
     if (!d.ok) { alert(d.error||'Failed'); return; }
-    showOAuthStep2(d.authUrl);
+    showManualOAuthStep2(d.authUrl);
   } catch(e) { alert(e.message); }
-  finally { document.getElementById('btn-login').disabled = false; }
 }
 
-function showOAuthStep2(authUrl) {
+function showManualOAuthStep2(authUrl) {
   var el = document.getElementById('oauth-content');
   el.innerHTML = '<div class="oauth-box">'
     +'<div class="step"><span class="step-num step-done">1</span><strong>Authorization URL generated</strong></div>'
     +'<div class="step"><span class="step-num">2</span><strong>Open this link to login:</strong><br>'
-    +'<a href="'+esc(authUrl)+'" target="_blank" id="oauth-url">'+esc(authUrl.substring(0,80))+'...</a></div>'
+    +'<a href="'+esc(authUrl)+'" target="_blank">'+esc(authUrl.substring(0,80))+'...</a></div>'
     +'<div class="step"><span class="step-num">3</span><strong>After login, paste the callback URL or code:</strong><br>'
     +'<input type="text" id="oauth-code-input" placeholder="Paste the full callback URL or just the code parameter">'
-    +'<div class="hint">After authorizing, you\'ll be redirected to a page. Copy the full URL from your browser\'s address bar and paste it here.</div>'
+    +'<div class="hint">After authorizing, copy the full URL from your browser and paste it here.</div>'
     +'<button onclick="submitOAuthCode()" class="btn-primary" style="margin-top:8px;padding:6px 20px">Submit</button>'
     +'</div></div>';
 }
@@ -131,16 +158,10 @@ function showOAuthStep2(authUrl) {
 async function submitOAuthCode() {
   var input = document.getElementById('oauth-code-input').value.trim();
   if (!input) { alert('Please paste the callback URL or code'); return; }
-
-  // Extract code from URL or use raw input
   var code = input;
   if (input.startsWith('http')) {
-    try {
-      var url = new URL(input);
-      code = url.searchParams.get('code') || input;
-    } catch(e) { /* use raw */ }
+    try { var url = new URL(input); code = url.searchParams.get('code') || input; } catch(e) {}
   }
-
   try {
     var res = await fetch('/auth-oauth-callback', {
       method: 'POST',
