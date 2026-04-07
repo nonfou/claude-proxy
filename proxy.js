@@ -176,34 +176,52 @@ function startLogin() {
   loginState.startedAt = new Date().toISOString();
 
   const cmd = findClaudeCommand();
-  const args = cmd === 'npx' ? ['--yes', '@anthropic-ai/claude-code', 'login'] : ['login'];
+  // claude REPL needs stdin for /login command; use 'claude' directly, not 'claude login'
+  const args = cmd === 'npx' ? ['--yes', '@anthropic-ai/claude-code'] : [];
 
   console.log('[login] Starting: ' + cmd + ' ' + args.join(' '));
 
   const child = spawn(cmd, args, {
-    env: { ...process.env, BROWSER: 'none', NO_COLOR: '1' },
+    env: { ...process.env, BROWSER: 'none', NO_COLOR: '1', TERM: 'dumb' },
     stdio: ['pipe', 'pipe', 'pipe'],
     shell: process.platform === 'win32',
   });
 
   loginState.process = child;
+  let loginSent = false;
 
   function handleOutput(data) {
     const text = data.toString();
     loginState.output += text;
     console.log('[login] ' + text.trim());
 
+    // When REPL is ready or prompts for login, send /login command
+    if (!loginSent) {
+      // Look for signs the REPL is ready: prompt, "Not logged in", or any interactive indicator
+      if (/not logged in|\/login|>\s*$/i.test(text) || text.includes('$') || text.includes('%')) {
+        loginSent = true;
+        console.log('[login] Sending /login command to REPL');
+        child.stdin.write('/login\n');
+      }
+    }
+
     // Look for authorization URL in output
     if (!loginState.authUrl) {
-      const urlMatch = text.match(/https:\/\/[^\s]+auth[^\s]*/i) ||
-                       text.match(/https:\/\/[^\s]+login[^\s]*/i) ||
-                       text.match(/https:\/\/[^\s]+oauth[^\s]*/i) ||
-                       text.match(/https:\/\/console\.anthropic\.com[^\s]*/i) ||
-                       text.match(/https:\/\/claude\.ai[^\s]*/i) ||
-                       text.match(/(https:\/\/[^\s]+)/);
-      if (urlMatch) {
-        loginState.authUrl = urlMatch[0].replace(/[)\]}>'"]+$/, ''); // trim trailing punctuation
-        console.log('[login] Auth URL found: ' + loginState.authUrl);
+      // Match URLs line by line to be more precise
+      const lines = text.split(/[\r\n]+/);
+      for (const line of lines) {
+        const urlMatch = line.match(/https:\/\/[^\s\x1b\u001b]+/);
+        if (urlMatch) {
+          // Clean ANSI escape codes and trailing punctuation
+          const url = urlMatch[0]
+            .replace(/\x1b\[[0-9;]*m/g, '')
+            .replace(/[\x1b\u001b]\[[0-9;]*[a-zA-Z]/g, '')
+            .replace(/[)\]}>'"]+$/, '');
+          if (url.length > 20) { // ignore very short matches
+            loginState.authUrl = url;
+            console.log('[login] Auth URL found: ' + url);
+          }
+        }
       }
     }
   }
@@ -211,24 +229,35 @@ function startLogin() {
   child.stdout.on('data', handleOutput);
   child.stderr.on('data', handleOutput);
 
+  // Fallback: send /login after a delay if not auto-detected
+  setTimeout(() => {
+    if (!loginSent && loginState.process) {
+      loginSent = true;
+      console.log('[login] Fallback: sending /login command');
+      child.stdin.write('/login\n');
+    }
+  }, 5000);
+
   child.on('close', (code) => {
     loginState.process = null;
+    // Check if token file was created/updated regardless of exit code
+    if (auth.filePath) {
+      const { token, error } = readTokenFromFile(auth.filePath);
+      if (!error && token) {
+        loginState.status = 'completed';
+        auth.mode = 'oauth';
+        auth.token = token;
+        auth.source = 'file:' + auth.filePath;
+        auth.headerValue = auth.headerName === 'x-api-key' ? token : 'Bearer ' + token;
+        auth.lastReadAt = new Date().toISOString();
+        auth.lastError = null;
+        console.log('[login] Login completed, token loaded: ' + maskToken(token));
+        return;
+      }
+    }
     if (code === 0) {
       loginState.status = 'completed';
-      console.log('[login] Login completed successfully');
-      // Refresh auth from file
-      if (auth.filePath) {
-        const { token, error } = readTokenFromFile(auth.filePath);
-        if (!error && token) {
-          auth.mode = 'oauth';
-          auth.token = token;
-          auth.source = 'file:' + auth.filePath;
-          auth.headerValue = auth.headerName === 'x-api-key' ? token : 'Bearer ' + token;
-          auth.lastReadAt = new Date().toISOString();
-          auth.lastError = null;
-          console.log('[login] Auth token loaded: ' + maskToken(token));
-        }
-      }
+      console.log('[login] Login process exited successfully');
     } else {
       loginState.status = 'failed';
       loginState.error = 'Process exited with code ' + code;
