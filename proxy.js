@@ -5,6 +5,7 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { URL } = require('url');
+const { execFile } = require('child_process');
 
 // Load .env file (zero-dependency, no need for dotenv package)
 const envPath = path.join(__dirname, '.env');
@@ -165,57 +166,62 @@ function httpsRequest(urlStr, options, postData) {
   });
 }
 
-// --- SessionKey-based OAuth (programmatic, no browser needed) ---
-// Chrome-like headers to avoid Cloudflare challenge
-var BROWSER_HEADERS = {
-  'accept': 'application/json',
-  'accept-language': 'en-US,en;q=0.9',
-  'cache-control': 'no-cache',
-  'content-type': 'application/json',
-  'origin': 'https://claude.ai',
-  'referer': 'https://claude.ai/',
-  'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
-};
+// --- SessionKey-based OAuth (programmatic, via curl to bypass Cloudflare TLS fingerprinting) ---
+
+// Generic curl-based request to claude.ai (avoids Cloudflare blocking Node.js TLS fingerprint)
+function claudeAiRequest(method, urlPath, sessionKey, body) {
+  return new Promise(function(resolve, reject) {
+    var url = 'https://claude.ai' + urlPath;
+    var args = [
+      '-s',                                // silent
+      '-w', '\n__CURL_HTTP_CODE__%{http_code}', // append status code
+      '-X', method,
+      '-H', 'accept: application/json',
+      '-H', 'accept-language: en-US,en;q=0.9',
+      '-H', 'cache-control: no-cache',
+      '-H', 'origin: https://claude.ai',
+      '-H', 'referer: https://claude.ai/',
+      '-H', 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',
+      '-H', 'cookie: sessionKey=' + sessionKey,
+    ];
+    if (body) {
+      args.push('-H', 'content-type: application/json');
+      args.push('-d', body);
+    }
+    args.push(url);
+
+    execFile('curl', args, { maxBuffer: 10 * 1024 * 1024, timeout: 30000 }, function(err, stdout, stderr) {
+      if (err) {
+        reject(new Error('curl failed: ' + (stderr || err.message)));
+        return;
+      }
+      var parts = stdout.split('\n__CURL_HTTP_CODE__');
+      var responseBody = parts[0];
+      var statusCode = parseInt(parts[1] || '0', 10);
+      try {
+        resolve({ status: statusCode, body: JSON.parse(responseBody) });
+      } catch (e) {
+        resolve({ status: statusCode, body: responseBody });
+      }
+    });
+  });
+}
 
 // Step 1: Get organization UUID using sessionKey cookie
 function getOrganizationUUID(sessionKey) {
-  return new Promise(function(resolve, reject) {
-    var opts = {
-      hostname: 'claude.ai',
-      port: 443,
-      path: '/api/organizations',
-      method: 'GET',
-      headers: Object.assign({}, BROWSER_HEADERS, {
-        'cookie': 'sessionKey=' + sessionKey,
-      }),
-    };
-    delete opts.headers['content-type'];
-    var req = https.request(opts, function(res) {
-      var chunks = [];
-      res.on('data', function(c) { chunks.push(c); });
-      res.on('end', function() {
-        var body = Buffer.concat(chunks).toString();
-        if (res.statusCode !== 200) {
-          reject(new Error('Get organizations failed: HTTP ' + res.statusCode + ' - ' + body.substring(0, 200)));
-          return;
-        }
-        try {
-          var orgs = JSON.parse(body);
-          if (!Array.isArray(orgs) || orgs.length === 0) {
-            reject(new Error('No organizations found'));
-            return;
-          }
-          // Prefer team org, otherwise use first
-          var org = orgs.find(function(o) { return o.raven_type === 'team'; }) || orgs[0];
-          console.log('[oauth] Step 1 OK: org=' + org.name + ' uuid=' + org.uuid);
-          resolve(org.uuid);
-        } catch (e) {
-          reject(new Error('Failed to parse organizations: ' + e.message));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.end();
+  console.log('[oauth] Step 1: Getting organization UUID...');
+  return claudeAiRequest('GET', '/api/organizations', sessionKey, null).then(function(res) {
+    if (res.status !== 200) {
+      throw new Error('Get organizations failed: HTTP ' + res.status + ' - ' + (typeof res.body === 'string' ? res.body.substring(0, 200) : JSON.stringify(res.body).substring(0, 200)));
+    }
+    var orgs = res.body;
+    if (!Array.isArray(orgs) || orgs.length === 0) {
+      throw new Error('No organizations found');
+    }
+    // Prefer team org, otherwise use first
+    var org = orgs.find(function(o) { return o.raven_type === 'team'; }) || orgs[0];
+    console.log('[oauth] Step 1 OK: org=' + org.name + ' uuid=' + org.uuid);
+    return org.uuid;
   });
 }
 
@@ -241,48 +247,22 @@ function getAuthorizationCode(sessionKey, orgUUID) {
     code_challenge_method: 'S256',
   });
 
-  return new Promise(function(resolve, reject) {
-    var opts = {
-      hostname: 'claude.ai',
-      port: 443,
-      path: '/v1/oauth/' + orgUUID + '/authorize',
-      method: 'POST',
-      headers: Object.assign({}, BROWSER_HEADERS, {
-        'cookie': 'sessionKey=' + sessionKey,
-        'content-length': String(Buffer.byteLength(postBody)),
-      }),
-    };
-    var req = https.request(opts, function(res) {
-      var chunks = [];
-      res.on('data', function(c) { chunks.push(c); });
-      res.on('end', function() {
-        var body = Buffer.concat(chunks).toString();
-        if (res.statusCode !== 200) {
-          reject(new Error('Get auth code failed: HTTP ' + res.statusCode + ' - ' + body.substring(0, 200)));
-          return;
-        }
-        try {
-          var result = JSON.parse(body);
-          if (!result.redirect_uri) {
-            reject(new Error('No redirect_uri in response'));
-            return;
-          }
-          var parsedUrl = new URL(result.redirect_uri);
-          var code = parsedUrl.searchParams.get('code');
-          if (!code) {
-            reject(new Error('No code in redirect_uri'));
-            return;
-          }
-          console.log('[oauth] Step 2 OK: got authorization code');
-          resolve(code);
-        } catch (e) {
-          reject(new Error('Failed to parse auth response: ' + e.message));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.write(postBody);
-    req.end();
+  console.log('[oauth] Step 2: Getting authorization code...');
+  return claudeAiRequest('POST', '/v1/oauth/' + orgUUID + '/authorize', sessionKey, postBody).then(function(res) {
+    if (res.status !== 200) {
+      throw new Error('Get auth code failed: HTTP ' + res.status + ' - ' + (typeof res.body === 'string' ? res.body.substring(0, 200) : JSON.stringify(res.body).substring(0, 200)));
+    }
+    var result = res.body;
+    if (!result.redirect_uri) {
+      throw new Error('No redirect_uri in response: ' + JSON.stringify(result).substring(0, 200));
+    }
+    var parsedUrl = new URL(result.redirect_uri);
+    var code = parsedUrl.searchParams.get('code');
+    if (!code) {
+      throw new Error('No code in redirect_uri');
+    }
+    console.log('[oauth] Step 2 OK: got authorization code');
+    return code;
   });
 }
 
